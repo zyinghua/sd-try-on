@@ -18,7 +18,7 @@ pipe = pipeline.from_pretrained(
 ).to(device)
 
 my_prompts = [
-    "full head portrait of a person"
+    "A person model wearing a dress"
 ] * 1
 
 images = pipe(
