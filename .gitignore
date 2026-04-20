@@ -5,3 +5,5 @@ checkpoints/
 .env
 logs/
 wandb/
+dataset/data/
+dataset/kaggle.json
