@@ -404,10 +404,12 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=[512],
+        nargs="+",
         help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
+            "The resolution for input images as 1 or 2 ints. Pass one value for a square (H=W=N) "
+            "or two values '--resolution H W' for a rectangle (e.g. '--resolution 512 384'). "
+            "All train/validation images are resized to this exact (H, W)."
         ),
     )
     parser.add_argument(
@@ -762,9 +764,15 @@ def parse_args(input_args=None):
                 f"(matching the number of validation items)"
             )
 
-    if args.resolution % 8 != 0:
+    if len(args.resolution) == 1:
+        args.resolution = (args.resolution[0], args.resolution[0])
+    elif len(args.resolution) == 2:
+        args.resolution = tuple(args.resolution)
+    else:
+        raise ValueError("`--resolution` must be one or two integers.")
+    if any(r % 8 != 0 for r in args.resolution):
         raise ValueError(
-            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
+            "Each dim of `--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
         )
 
     return args
@@ -865,7 +873,6 @@ def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -874,7 +881,6 @@ def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
     conditioning_image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
         ]
     )

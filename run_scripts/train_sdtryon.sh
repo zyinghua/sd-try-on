@@ -11,7 +11,7 @@ accelerate launch train.py \
     --output_dir "/root/autodl-tmp/sdtryon-model" \
     --num_train_epochs 1 \
     --max_train_steps 50000 \
-    --resolution 512 \
+    --resolution 512 384 \
     --learning_rate 1e-5 \
     --train_batch_size 2 \
     --gradient_accumulation_steps 1 \
