@@ -1,12 +1,5 @@
 """Extract the upper-body garment region from image-parse-v3 parse maps.
 
-The parse maps are P-mode indexed PNGs following the LIP / VITON-HD palette.
-The paired product images in `cloth/` are always upper-body garments, which
-may be labeled as upper-clothes (5), dress (6), or coat (7) in the parse map,
-so this script unions those three classes into a single binary mask
-(cloth=255, else=0) and writes it into a sibling `image_cloth_mask/`
-directory.
-
 Usage:
     python dataset/extract_cloth_mask.py [parse_dir]
 
@@ -24,8 +17,8 @@ from PIL import Image
 # LIP palette: 5 upper-clothes, 6 dress, 7 coat — all appear as upper-body
 # products in VITON-HD's `cloth/` directory.
 UPPER_GARMENT_LABELS = (5, 6, 7)
-OUTPUT_DIRNAME = "image_cloth_mask"
-DEFAULT_INPUT = Path(__file__).resolve().parent / "data" / "train" / "image-parse-v3"
+OUTPUT_DIRNAME = "/root/autodl-tmp/data/sdtryon/train/image_cloth_mask"
+DEFAULT_INPUT = Path("/root/autodl-tmp/data/sdtryon/train/image-parse-v3")
 
 
 def extract(parse_path: Path, out_path: Path, labels) -> None:

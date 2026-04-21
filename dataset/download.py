@@ -16,7 +16,7 @@ from pathlib import Path
 
 DATASET = "marquis03/high-resolution-viton-zalando-dataset"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEST = SCRIPT_DIR / "data"
+DEST = Path("/root/autodl-tmp/data/sdtryon")
 
 
 def ensure_kaggle():
