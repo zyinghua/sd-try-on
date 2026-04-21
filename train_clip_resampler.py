@@ -808,8 +808,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--image_encoder_path",
         type=str,
-        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-        help="Path/repo id for the CLIPVisionModelWithProjection image encoder used for cloth conditioning.",
+        default="patrickjohncyh/fashion-clip",
+        help=(
+            "Path/repo id for the CLIPVisionModelWithProjection image encoder used for cloth "
+            "conditioning. Defaults to Fashion-CLIP (ViT-B/32 fine-tuned on fashion data)."
+        ),
     )
     parser.add_argument(
         "--num_ip_tokens",
