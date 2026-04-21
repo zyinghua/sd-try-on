@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent / "data"
+ROOT = Path("/root/autodl-tmp/data/sdtryon")
 TARGET = (384, 512)  # PIL uses (width, height); original is 768x1024
 SCALE = 0.5  # 1024 -> 512, 768 -> 384
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
