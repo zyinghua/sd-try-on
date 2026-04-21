@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# source /etc/network_turbo
+# export HF_HUB_DISABLE_XET=1
+
+accelerate launch train.py \
+    --pretrained_model_name_or_path "Manojb/stable-diffusion-2-1-base" \
+    --image_encoder_path "laion/CLIP-ViT-H-14-laion2B-s32B-b79K" \
+    --conditioning_channels 3 \
+    --train_data_dir "/root/autodl-tmp/viton-hd-dataset" \
+    --output_dir "/root/autodl-tmp/sdtryon-model" \
+    --num_train_epochs 1 \
+    --max_train_steps 50000 \
+    --resolution 512 \
+    --learning_rate 1e-5 \
+    --train_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --checkpointing_steps 5000 \
+    --checkpoints_total_limit 20 \
+    --validation_steps 500 \
+    --validation_prompt "A photo of a person wearing a short-sleeve t-shirt, standing in front of a plain background." "A photo of a person wearing a long-sleeve blouse, standing in front of a plain background." \
+    --validation_image "/root/autodl-tmp/viton-hd-dataset/pose/sample_00087.png" "/root/autodl-tmp/viton-hd-dataset/pose/sample_00000.png" \
+    --validation_cloth_image "/root/autodl-tmp/viton-hd-dataset/cloth/sample_00087.jpg" "/root/autodl-tmp/viton-hd-dataset/cloth/sample_00000.jpg" \
+    --ip_adapter_image_drop_rate 0.05 \
+    #--pretrained_ip_adapter_path "/path/to/pretrained_ip_adapter.bin" \
