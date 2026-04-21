@@ -54,7 +54,7 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
-from ip_adapter.ip_adapter_faceid import MLPProjModel
+from ip_adapter.ip_adapter import ImageProjModel
 from ip_adapter.utils import is_torch2_available
 
 if is_torch2_available():
@@ -151,27 +151,27 @@ class IPAdapter(torch.nn.Module):
 
 class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
 
-    def load_ip_adapter_faceid(self, model_ckpt: str, image_emb_dim: int = 512, num_tokens: int = 4, scale: float = 1.0):
-        self.set_image_proj_model(image_emb_dim, num_tokens)
+    def load_ip_adapter(self, model_ckpt: str, clip_embeddings_dim: int = 1024, num_tokens: int = 4, scale: float = 1.0):
+        self.set_image_proj_model(clip_embeddings_dim, num_tokens)
         ip_adapter_modules = self.set_ip_adapter(num_tokens, scale)
-        
+
         self.ip_adapter = IPAdapter(
             image_proj_model=self.image_proj_model,
             adapter_modules=ip_adapter_modules,
             ckpt_path=model_ckpt
         )
-    
-    def set_image_proj_model(self, image_emb_dim: int = 512, num_tokens: int = 4):
-        image_proj_model = MLPProjModel(
+
+    def set_image_proj_model(self, clip_embeddings_dim: int = 1024, num_tokens: int = 4):
+        image_proj_model = ImageProjModel(
             cross_attention_dim=self.unet.config.cross_attention_dim,
-            id_embeddings_dim=image_emb_dim,
-            num_tokens=num_tokens,
+            clip_embeddings_dim=clip_embeddings_dim,
+            clip_extra_context_tokens=num_tokens,
         )
-        
+
         image_proj_model.eval()
         self.image_proj_model = image_proj_model.to(self.unet.device).to(self.unet.dtype)
-        
-        self._faceid_embedding_dim = image_emb_dim
+
+        self._clip_embeddings_dim = clip_embeddings_dim
     
     def set_ip_adapter(self, num_tokens: int = 4, scale: float = 1.0):
         # Check if UNet already has IP-Adapter processors (from validation)
@@ -236,7 +236,7 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
         control_guidance_start=0.0,
         control_guidance_end=1.0,
         callback_on_step_end_tensor_inputs=None,
-        faceid_embeddings=None,
+        image_embeds=None,
         mask_image=None,
         image=None,
     ):
@@ -255,16 +255,16 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
             control_guidance_end,
             callback_on_step_end_tensor_inputs,
         )
-        
-        # Validate FaceID embeddings
-        if faceid_embeddings is None:
+
+        # Validate cloth CLIP image embeddings
+        if image_embeds is None:
             raise ValueError(
-                "`faceid_embeddings` must be provided for StableDiffusionIDControlPipeline. "
-                "Please provide FaceID embeddings as a torch.Tensor."
+                "`image_embeds` must be provided for StableDiffusionIDControlPipeline. "
+                "Please encode the cloth image with a CLIP vision encoder and pass the projected embeddings."
             )
-        
-        if not isinstance(faceid_embeddings, torch.Tensor):
-            raise ValueError(f"`faceid_embeddings` must be a torch.Tensor, but got {type(faceid_embeddings)}")
+
+        if not isinstance(image_embeds, torch.Tensor):
+            raise ValueError(f"`image_embeds` must be a torch.Tensor, but got {type(image_embeds)}")
         
         if mask_image is not None:
             if self.unet.config.in_channels != 4:
@@ -284,33 +284,33 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
 
         return timesteps, num_inference_steps - t_start
 
-    def prepare_faceid_embeddings(
+    def prepare_image_embeds(
         self,
-        faceid_embeddings: torch.Tensor,
+        image_embeds: torch.Tensor,
         device: torch.device,
         batch_size: int,
         num_images_per_prompt: int,
         do_classifier_free_guidance: bool,
     ) -> torch.Tensor:
         """
-        Expand FaceID embeddings to match the batch size and number of images per prompt.
+        Expand cloth CLIP image embeddings to match the batch size and number of images per prompt.
         Handle CFG if enabled.
         """
-        if faceid_embeddings.shape[0] == 1:
-            faceid_embeddings = faceid_embeddings.repeat(batch_size * num_images_per_prompt, 1)
-        elif faceid_embeddings.shape[0] != batch_size:
+        if image_embeds.shape[0] == 1:
+            image_embeds = image_embeds.repeat(batch_size * num_images_per_prompt, 1)
+        elif image_embeds.shape[0] != batch_size:
             raise ValueError(
-                f"FaceID embeddings batch size ({faceid_embeddings.shape[0]}) must match prompt batch size ({batch_size})"
+                f"Image embeds batch size ({image_embeds.shape[0]}) must match prompt batch size ({batch_size})"
             )
         else:
-            faceid_embeddings = faceid_embeddings.repeat_interleave(num_images_per_prompt, dim=0)
-        
-        faceid_embeddings = faceid_embeddings.to(device=device)
-        
+            image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+
+        image_embeds = image_embeds.to(device=device)
+
         if do_classifier_free_guidance:
-            faceid_embeddings = torch.cat([torch.zeros_like(faceid_embeddings), faceid_embeddings], dim=0)
-        
-        return faceid_embeddings
+            image_embeds = torch.cat([torch.zeros_like(image_embeds), image_embeds], dim=0)
+
+        return image_embeds
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint.StableDiffusionInpaintPipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
@@ -443,7 +443,7 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
         self,
         prompt: Union[str, List[str]] = None,
         control_image: PipelineImageInput = None,
-        faceid_embeddings: Optional[torch.Tensor] = None,
+        image_embeds: Optional[torch.Tensor] = None,
         mask_image: Optional[PipelineImageInput] = None,
         image: Optional[PipelineImageInput] = None,
         height: Optional[int] = None,
@@ -492,8 +492,8 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
                 to a single ControlNet. When `prompt` is a list, and if a list of images is passed for a single
                 ControlNet, each will be paired with each prompt in the `prompt` list. This also applies to multiple
                 ControlNets, where a list of image lists can be passed to batch for each prompt and each ControlNet.
-            faceid_embeddings (`torch.Tensor`):
-                The FaceID embeddings to use for the IP-Adapter.
+            image_embeds (`torch.Tensor`):
+                Cloth image CLIP embeddings (output of `CLIPVisionModelWithProjection.image_embeds`) to use for the IP-Adapter.
             mask_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`,
                     `List[PIL.Image.Image]`, or `List[np.ndarray]`):
                 `Image`, NumPy array or tensor representing an image batch to mask `image`. White pixels in the mask
@@ -654,7 +654,7 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
             control_guidance_start,
             control_guidance_end,
             callback_on_step_end_tensor_inputs,
-            faceid_embeddings,
+            image_embeds,
             mask_image,
             image,
         )
@@ -705,21 +705,21 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-        faceid_embeddings_prepared = self.prepare_faceid_embeddings(
-            faceid_embeddings,
+        image_embeds_prepared = self.prepare_image_embeds(
+            image_embeds,
             device,
             batch_size,
             num_images_per_prompt,
             self.do_classifier_free_guidance,
         )
-        
+
         # Check if IP adapter is loaded
         if not hasattr(self, 'ip_adapter') or self.ip_adapter is None:
             raise ValueError(
-                "IP-Adapter is not loaded. Please call `load_ip_adapter_faceid()` before using the pipeline."
+                "IP-Adapter is not loaded. Please call `load_ip_adapter()` before using the pipeline."
             )
-        
-        prompt_embeds, ip_tokens = self.ip_adapter(prompt_embeds.to(self.unet.device), faceid_embeddings_prepared.to(self.unet.device))
+
+        prompt_embeds, ip_tokens = self.ip_adapter(prompt_embeds.to(self.unet.device), image_embeds_prepared.to(self.unet.device))
         prompt_embeds = prompt_embeds.to(device=device)
         ip_tokens = ip_tokens.to(device=device)
 
