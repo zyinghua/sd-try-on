@@ -3,7 +3,7 @@
 # source /etc/network_turbo
 # export HF_HUB_DISABLE_XET=1
 
-accelerate launch train.py \
+accelerate launch train_clip_resampler.py \
     --pretrained_model_name_or_path "Manojb/stable-diffusion-2-1-base" \
     --image_encoder_path "patrickjohncyh/fashion-clip" \
     --conditioning_channels 3 \
@@ -18,8 +18,8 @@ accelerate launch train.py \
     --checkpointing_steps 5000 \
     --checkpoints_total_limit 20 \
     --validation_steps 500 \
-    --validation_prompt "A photo of a person wearing a short-sleeve t-shirt, standing in front of a plain background." "A photo of a person wearing a long-sleeve blouse, standing in front of a plain background." \
-    --validation_image "/root/autodl-tmp/viton-hd-dataset/pose/sample_00087.png" "/root/autodl-tmp/viton-hd-dataset/pose/sample_00000.png" \
-    --validation_cloth_image "/root/autodl-tmp/viton-hd-dataset/cloth/sample_00087.jpg" "/root/autodl-tmp/viton-hd-dataset/cloth/sample_00000.jpg" \
+    --validation_prompt "A female wearing a white T-shirt with a red LEVI's logo." "A female wearing a black T-shirt with white logo and text." \
+    --validation_image "/root/autodl-tmp/data/sdtryon/train/image/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/image/00019_00.jpg" \
+    --validation_cloth_image "/root/autodl-tmp/data/sdtryon/train/cloth/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/cloth/00019_00.jpg" \
     --ip_adapter_image_drop_rate 0.05 \
     #--pretrained_ip_adapter_path "/path/to/pretrained_ip_adapter.bin" \
