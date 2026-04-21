@@ -36,12 +36,11 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
-from scripts.models.iresnet import iresnet100
 from packaging import version
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModelWithProjection, PretrainedConfig
 
 import diffusers
 from diffusers import (
@@ -58,7 +57,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from ip_adapter.ip_adapter_faceid import MLPProjModel
+from ip_adapter.ip_adapter import ImageProjModel
 from ip_adapter.utils import is_torch2_available
 
 if is_torch2_available():
@@ -139,7 +138,8 @@ def image_grid(imgs, rows, cols):
 
 
 def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False, ip_adapter=None
+    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step,
+    image_encoder, clip_image_processor, is_final_validation=False, ip_adapter=None
 ):
     logger.info("Running validation... ")
 
@@ -171,7 +171,7 @@ def log_validation(
     elif is_final_validation:
         # Load IP-Adapter from checkpoint for final validation
         ip_adapter_ckpt_path = os.path.join(args.output_dir, "ip_adapter", "ip_adapter.bin")
-        pipeline.load_ip_adapter_faceid(ip_adapter_ckpt_path, image_emb_dim=args.faceid_embedding_dim)
+        pipeline.load_ip_adapter(ip_adapter_ckpt_path, clip_embeddings_dim=image_encoder.config.projection_dim)
     
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
@@ -198,11 +198,11 @@ def log_validation(
             "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
         )
     
-    # Handle FaceID embeddings
-    validation_faceid_embeddings = args.validation_faceid_embedding * len(validation_images) if len(args.validation_faceid_embedding) == 1 else args.validation_faceid_embedding
-    if len(validation_faceid_embeddings) != len(validation_images):
+    # Handle cloth images
+    validation_cloth_images = args.validation_cloth_image * len(validation_images) if len(args.validation_cloth_image) == 1 else args.validation_cloth_image
+    if len(validation_cloth_images) != len(validation_images):
         raise ValueError(
-            f"Number of FaceID embeddings ({len(validation_faceid_embeddings)}) must match number of validation images ({len(validation_images)})."
+            f"Number of cloth images ({len(validation_cloth_images)}) must match number of validation images ({len(validation_images)})."
         )
     
     if args.use_fixed_timestep:
@@ -220,18 +220,19 @@ def log_validation(
 
         images = []
 
-        # Load FaceID embedding
-        faceid_embedding = torch.load(validation_faceid_embeddings[idx], map_location=accelerator.device)
-        faceid_embedding = faceid_embedding.to(dtype=weight_dtype)
-        if faceid_embedding.dim() == 1:
-            faceid_embedding = faceid_embedding.unsqueeze(0)
+        # Encode cloth image with CLIP
+        cloth_image = Image.open(validation_cloth_images[idx]).convert("RGB")
+        clip_pixel_values = clip_image_processor(images=cloth_image, return_tensors="pt").pixel_values
+        clip_pixel_values = clip_pixel_values.to(device=accelerator.device, dtype=weight_dtype)
+        with torch.no_grad():
+            cloth_image_embeds = image_encoder(clip_pixel_values).image_embeds
 
         for _ in range(args.num_validation_images):
             with inference_ctx:
                 image = pipeline(
                     prompt=validation_prompt,
                     control_image=validation_image,
-                    faceid_embeddings=faceid_embedding,
+                    image_embeds=cloth_image_embeds,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
@@ -603,22 +604,10 @@ def parse_args(input_args=None):
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--faceid_embedding_column",
+        "--cloth_image_column",
         type=str,
-        default="faceid_embedding",
-        help="The column of the dataset containing the target faceid embedding pt file path.",
-    )
-    parser.add_argument(
-        "--source_faceid_embedding_column",
-        type=str,
-        default="source_faceid_embedding",
-        help="The column of the dataset containing the source faceid embedding pt file path.",
-    )
-    parser.add_argument(
-        "--source_caption_column",
-        type=str,
-        default="source_text",
-        help="The column of the dataset containing the source image caption (for L_id branch).",
+        default="cloth_image",
+        help="The column of the dataset containing the (canonical) cloth image file path used for IP-Adapter conditioning.",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -659,14 +648,14 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--validation_faceid_embedding",
+        "--validation_cloth_image",
         type=str,
         default=None,
         nargs="+",
         help=(
-            "A set of paths to FaceID embedding .pt files for validation when IP-Adapter is enabled."
-            " Provide either a matching number of `--validation_image`s, a single embedding to be used"
-            " with all validation images, or a single embedding that will be used with all validation images."
+            "A set of paths to cloth images for validation when IP-Adapter is enabled."
+            " Provide either a matching number of `--validation_image`s, a single cloth image to be used"
+            " with all validation prompts, or a single cloth image to be used with all validation prompts."
         ),
     )
     parser.add_argument(
@@ -716,22 +705,10 @@ def parse_args(input_args=None):
         help="Drop rate for IP-Adapter image embeddings during training (for classifier-free guidance).",
     )
     parser.add_argument(
-        "--faceid_embedding_dim",
-        type=int,
-        default=512,
-        help="Dimension of FaceID embeddings. Default is 512.",
-    )
-    parser.add_argument(
-        "--id_loss_weight",
-        type=float,
-        default=0.1,
-        help="Weight for identity preservation loss (L_id). Default is 0.1.",
-    )
-    parser.add_argument(
-        "--faceid_encoder_path",
+        "--image_encoder_path",
         type=str,
-        default="checkpoints/glint360k_r100.pth",
-        help="Path to faceid encoder checkpoint.",
+        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        help="Path/repo id for the CLIPVisionModelWithProjection image encoder used for cloth conditioning.",
     )
 
 
@@ -764,24 +741,24 @@ def parse_args(input_args=None):
             " or the same number of `--validation_prompt`s and `--validation_image`s"
         )
     
-    # Check that validation_faceid_embedding is provided when validation is enabled
-    if (args.validation_prompt is not None or args.validation_image is not None) and args.validation_faceid_embedding is None:
+    # Check that validation_cloth_image is provided when validation is enabled
+    if (args.validation_prompt is not None or args.validation_image is not None) and args.validation_cloth_image is None:
         raise ValueError(
-            "`--validation_faceid_embedding` must be provided when using validation. "
-            "ID Control pipeline requires FaceID embeddings for validation."
+            "`--validation_cloth_image` must be provided when using validation. "
+            "Try-on pipeline requires a cloth image for validation."
         )
-    
-    if args.validation_faceid_embedding is not None:
+
+    if args.validation_cloth_image is not None:
         num_validation_items = max(
             len(args.validation_image) if args.validation_image else 1,
             len(args.validation_prompt) if args.validation_prompt else 1
         )
         if (
-            len(args.validation_faceid_embedding) != 1
-            and len(args.validation_faceid_embedding) != num_validation_items
+            len(args.validation_cloth_image) != 1
+            and len(args.validation_cloth_image) != num_validation_items
         ):
             raise ValueError(
-                f"Must provide either 1 `--validation_faceid_embedding` or {num_validation_items} "
+                f"Must provide either 1 `--validation_cloth_image` or {num_validation_items} "
                 f"(matching the number of validation items)"
             )
 
@@ -793,7 +770,7 @@ def parse_args(input_args=None):
     return args
 
 
-def make_train_dataset(args, tokenizer, accelerator):
+def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
     
@@ -855,34 +832,14 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
     
-    if args.faceid_embedding_column is None:
-        faceid_embedding_column = column_names[3]
-        logger.info(f"faceid embedding column defaulting to {faceid_embedding_column}")
+    if args.cloth_image_column is None:
+        cloth_image_column = column_names[3]
+        logger.info(f"cloth image column defaulting to {cloth_image_column}")
     else:
-        faceid_embedding_column = args.faceid_embedding_column
-        if faceid_embedding_column not in column_names:
+        cloth_image_column = args.cloth_image_column
+        if cloth_image_column not in column_names:
             raise ValueError(
-                f"`--faceid_embedding_column` value '{args.faceid_embedding_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.source_faceid_embedding_column is None:
-        source_faceid_embedding_column = column_names[4]
-        logger.info(f"source faceid embedding column defaulting to {source_faceid_embedding_column}")
-    else:
-        source_faceid_embedding_column = args.source_faceid_embedding_column
-        if source_faceid_embedding_column not in column_names:
-            raise ValueError(
-                f"`--source_faceid_embedding_column` value '{args.source_faceid_embedding_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.source_caption_column is None:
-        source_caption_column = column_names[5]
-        logger.info(f"source caption column defaulting to {source_caption_column}")
-    else:
-        source_caption_column = args.source_caption_column
-        if source_caption_column not in column_names:
-            raise ValueError(
-                f"`--source_caption_column` value '{args.source_caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                f"`--cloth_image_column` value '{args.cloth_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
     def tokenize_captions(examples, caption_col, is_train=True, apply_empty_prompt_dropout=True):
@@ -944,29 +901,19 @@ def make_train_dataset(args, tokenizer, accelerator):
         examples["conditioning_pixel_values"] = conditioning_images
         examples["input_ids"] = tokenize_captions(examples, caption_column)
 
-        # Load FaceID embeddings for IP-Adapter (target embeddings)
-        faceid_embeddings = []
+        # Load cloth images and preprocess for the CLIP image encoder
+        cloth_pixel_values = []
         drop_image_embeds = []
-        for embed_path in examples[faceid_embedding_column]:
-            # Randomly drop image embeddings for cfg
+        for cloth_path in examples[cloth_image_column]:
             drop_image_embed = 1 if random.random() < args.ip_adapter_image_drop_rate else 0
             drop_image_embeds.append(drop_image_embed)
-            embed_full_path = Path(args.train_data_dir) / embed_path
-            face_id_embed = torch.load(embed_full_path, map_location="cpu")
-            faceid_embeddings.append(face_id_embed)
-        
-        examples["faceid_embeddings"] = faceid_embeddings
+            cloth_full_path = Path(args.train_data_dir) / cloth_path
+            cloth_img = Image.open(cloth_full_path).convert("RGB")
+            clip_px = clip_image_processor(images=cloth_img, return_tensors="pt").pixel_values[0]
+            cloth_pixel_values.append(clip_px)
+
+        examples["cloth_pixel_values"] = cloth_pixel_values
         examples["drop_image_embeds"] = drop_image_embeds
-
-        # Load source FaceID embeddings for face swapping
-        source_faceid_embeddings = []
-        for embed_path in examples[source_faceid_embedding_column]:
-            embed_full_path = Path(args.train_data_dir) / embed_path
-            source_face_id_embed = torch.load(embed_full_path, map_location="cpu")
-            source_faceid_embeddings.append(source_face_id_embed)
-
-        examples["source_faceid_embeddings"] = source_faceid_embeddings
-        examples["source_input_ids"] = tokenize_captions(examples, source_caption_column, apply_empty_prompt_dropout=False)
 
         return examples
 
@@ -988,91 +935,18 @@ def collate_fn(examples):
 
     input_ids = torch.stack([example["input_ids"] for example in examples])
 
-    # Add IP-Adapter FaceID embeddings (target embeddings)
-    faceid_embeddings = torch.cat([example["faceid_embeddings"] for example in examples], dim=0)
+    # CLIP-preprocessed cloth pixel values for IP-Adapter conditioning
+    cloth_pixel_values = torch.stack([example["cloth_pixel_values"] for example in examples])
+    cloth_pixel_values = cloth_pixel_values.to(memory_format=torch.contiguous_format).float()
     drop_image_embeds = [example["drop_image_embeds"] for example in examples]
 
-    # Add source FaceID embeddings
-    source_faceid_embeddings = torch.cat([example["source_faceid_embeddings"] for example in examples], dim=0)
-
-    # Add source caption input_ids for L_id branch
-    source_input_ids = torch.stack([example["source_input_ids"] for example in examples])
-
-    result = {
+    return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
-        "faceid_embeddings": faceid_embeddings,
+        "cloth_pixel_values": cloth_pixel_values,
         "drop_image_embeds": drop_image_embeds,
-        "source_faceid_embeddings": source_faceid_embeddings,
-        "source_input_ids": source_input_ids,
     }
-
-    return result
-
-
-def one_step_clean_pixel_extraction(model_pred_id, noisy_latents, timesteps, noise_scheduler, vae, use_fixed_timestep):
-    """
-    Extract a one-step clean pixel estimate from the noise prediction.
-    """
-    if noise_scheduler.config.prediction_type != "epsilon":
-        raise ValueError(f"One Step Clean Extraction: Unsupported prediction type {noise_scheduler.config.prediction_type} ")
-
-    if use_fixed_timestep:
-        pred_original_sample = noise_scheduler.step(
-            model_output=model_pred_id,
-            timestep=timesteps,
-            sample=noisy_latents,
-            return_dict=False,
-        )[0]
-    else:
-        alpha_cumprod_t = noise_scheduler.alphas_cumprod[timesteps].to(
-            device=noisy_latents.device, dtype=noisy_latents.dtype
-        )
-        alpha_cumprod_t = alpha_cumprod_t.view(-1, 1, 1, 1)
-
-        pred_original_sample = (noisy_latents - ((1 - alpha_cumprod_t) ** 0.5) * model_pred_id) / (alpha_cumprod_t ** 0.5)
-
-    scaled_latents = pred_original_sample / vae.config.scaling_factor
-    
-    with torch.no_grad():
-        decoded = vae.decode(scaled_latents, return_dict=False)[0]
-    
-    pred_x0 = (decoded / 2 + 0.5).clamp(0, 1) # [B, C, H, W]
-    #pred_x0 = pred_x0.permute(0, 2, 3, 1)
-    
-    return pred_x0
-
-
-def extract_faceid_embedding(faceid_encoder, pred_x0, device):
-    """
-    Extract FaceID embedding using a frozen FaceID encoder model.
-    """
-    pred_tensor_resized = F.interpolate(pred_x0, size=(112, 112), mode="bilinear", align_corners=False)  # [B, 3, 112, 112]
-    
-    # Normalize: transform from [0, 1] to [-1, 1]
-    pred_tensor_normalized = pred_tensor_resized * 2 - 1 # [B, C, H, W]
-    pred_tensor_normalized = pred_tensor_normalized.to(device)
-    
-    with torch.no_grad():
-        embeddings = faceid_encoder(pred_tensor_normalized)  # [B, 512]
-    
-    return F.normalize(embeddings, p=2.0, dim=1)
-
-
-def compute_id_loss(pred_x0, source_faceid_embeddings, faceid_encoder, device):
-    """
-    Compute L_id loss: identity preservation loss using cosine similarity.
-    """
-    pred_faceid_embeddings = extract_faceid_embedding(faceid_encoder, pred_x0, device)  # [B, 512]
-    
-    source_faceid_embeddings = source_faceid_embeddings.to(device)
-    source_flat = source_faceid_embeddings.squeeze(1)  # [B, 512]
-    
-    cosine_sim = (pred_faceid_embeddings * source_flat).sum(dim=-1)  # [B]
-    l_id_loss = (1 - cosine_sim).mean()
-    
-    return l_id_loss
 
 
 def main(args):
@@ -1158,20 +1032,20 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet, conditioning_channels=args.conditioning_channels)
 
-    # Load FaceID encoder model for id loss
-    logger.info(f"Loading FaceID encoder weights")
-    faceid_encoder = iresnet100(pretrained=False, fp16=False)
-    faceid_encoder.load_state_dict(torch.load(args.faceid_encoder_path, map_location=accelerator.device))
-    faceid_encoder.requires_grad_(False)
+    # Load CLIP image encoder for cloth conditioning
+    logger.info(f"Loading CLIP image encoder from {args.image_encoder_path}")
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    image_encoder.requires_grad_(False)
+    clip_image_processor = CLIPImageProcessor.from_pretrained(args.image_encoder_path)
 
     # Initialize IP-Adapter components
     logger.info("Initializing IP-Adapter components")
-    
+
     # Initialize IP-Adapter projection model
-    image_proj_model_ip_adapter = MLPProjModel(
+    image_proj_model_ip_adapter = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        id_embeddings_dim=args.faceid_embedding_dim,
-        num_tokens=4,
+        clip_embeddings_dim=image_encoder.config.projection_dim,
+        clip_extra_context_tokens=4,
     )
     
     # Initialize IP-Adapter attention processors
@@ -1341,7 +1215,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = make_train_dataset(args, tokenizer, accelerator)
+    train_dataset = make_train_dataset(args, tokenizer, accelerator, clip_image_processor)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1389,7 +1263,7 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    faceid_encoder.to(accelerator.device)
+    image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1412,7 +1286,7 @@ def main(args):
         # tensorboard cannot handle list types for config
         tracker_config.pop("validation_prompt")
         tracker_config.pop("validation_image")
-        tracker_config.pop("validation_faceid_embedding")
+        tracker_config.pop("validation_cloth_image")
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
@@ -1502,8 +1376,10 @@ def main(args):
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
 
                 # ======================= IP-Adapter =========================
-                image_embeds = batch["faceid_embeddings"].to(accelerator.device, dtype=weight_dtype)
-                
+                cloth_pixel_values = batch["cloth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                with torch.no_grad():
+                    image_embeds = image_encoder(cloth_pixel_values).image_embeds
+
                 # Apply drop for cfg
                 image_embeds_processed = []
                 for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
@@ -1512,7 +1388,7 @@ def main(args):
                     else:
                         image_embeds_processed.append(image_embed)
                 image_embeds = torch.stack(image_embeds_processed)
-                
+
                 encoder_hidden_states, controlnet_encoder_hidden_states = ip_adapter(encoder_hidden_states, image_embeds)
                 # ======================= IP-Adapter =========================
 
@@ -1523,7 +1399,7 @@ def main(args):
                     controlnet_cond=controlnet_image,
                     return_dict=False,
                 )
-                
+
                 # Predict the noise residual
                 model_pred = unet(
                     noisy_latents,
@@ -1536,35 +1412,6 @@ def main(args):
                     return_dict=False,
                 )[0]
 
-                # ======================= L_id Branch =========================
-                # Second forward pass for identity preservation loss
-                # Uses same target image, noise, timesteps, and landmarks,
-                # but with source faceid embeddings and source caption.
-                encoder_hidden_states_id = text_encoder(batch["source_input_ids"], return_dict=False)[0]
-                
-                source_image_embeds = batch["source_faceid_embeddings"].to(accelerator.device, dtype=weight_dtype)
-                encoder_hidden_states_id, controlnet_encoder_hidden_states_id = ip_adapter(encoder_hidden_states_id, source_image_embeds)
-                
-                down_block_res_samples_id, mid_block_res_sample_id = controlnet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=controlnet_encoder_hidden_states_id,
-                    controlnet_cond=controlnet_image,
-                    return_dict=False,
-                )
-                
-                model_pred_id = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states_id.to(dtype=weight_dtype),
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples_id
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample_id.to(dtype=weight_dtype),
-                    return_dict=False,
-                )[0]
-                # ======================= L_id Branch =========================
-
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -1573,21 +1420,6 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                
-                # Compute L_id loss (identity preservation loss)
-                pred_x0 = one_step_clean_pixel_extraction(
-                    model_pred_id, noisy_latents, timesteps, noise_scheduler, vae, args.use_fixed_timestep
-                )
-                
-                source_faceid_emb = batch["source_faceid_embeddings"].to(accelerator.device, dtype=weight_dtype)
-                loss_id = compute_id_loss(
-                    pred_x0=pred_x0.float(),
-                    source_faceid_embeddings=source_faceid_emb,
-                    faceid_encoder=faceid_encoder,
-                    device=accelerator.device
-                )
-
-                loss += args.id_loss_weight * loss_id
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1646,6 +1478,8 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
+                            image_encoder=image_encoder,
+                            clip_image_processor=clip_image_processor,
                             ip_adapter=ip_adapter,
                         )
 
@@ -1684,6 +1518,8 @@ def main(args):
                 accelerator=accelerator,
                 weight_dtype=weight_dtype,
                 step=global_step,
+                image_encoder=image_encoder,
+                clip_image_processor=clip_image_processor,
                 is_final_validation=True,
                 ip_adapter=None,
             )
