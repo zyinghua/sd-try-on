@@ -12,25 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-StableDiffusionTryOnClipResamplerPipeline
-
-IP-Adapter-Plus variant of the sd-try-on pipeline. Consumes CLIP patch tokens
-(penultimate hidden_states[-2]) through a Perceiver-style Resampler that
-produces `num_queries` IP tokens, which are concatenated to the text tokens
-via decoupled IPAttnProcessor cross-attention. ControlNet (pose) + scheduler
-+ CFG machinery is forked verbatim from pipeline_sdtryon.py so this module
-can be edited independently.
-"""
 
 import inspect
-import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
@@ -66,6 +54,7 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
+from ip_adapter.ip_adapter import ImageProjModel
 from ip_adapter.utils import is_torch2_available
 
 if is_torch2_available():
@@ -74,105 +63,6 @@ else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-# ---------------------------------------------------------------------------
-# Resampler (IP-Adapter-Plus projection head)
-# ---------------------------------------------------------------------------
-def _ff(dim, mult=4):
-    inner_dim = int(dim * mult)
-    return nn.Sequential(
-        nn.LayerNorm(dim),
-        nn.Linear(dim, inner_dim, bias=False),
-        nn.GELU(),
-        nn.Linear(inner_dim, dim, bias=False),
-    )
-
-
-def _reshape_heads(x, heads):
-    b, n, _ = x.shape
-    x = x.view(b, n, heads, -1).transpose(1, 2)
-    return x  # (b, heads, n, dim_head)
-
-
-class PerceiverAttention(nn.Module):
-    """Perceiver-style cross-attention: learned latents attend to concat(image tokens, latents)."""
-
-    def __init__(self, *, dim, dim_head=64, heads=8):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.dim_head = dim_head
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim, bias=False)
-
-    def forward(self, x, latents):
-        x = self.norm1(x)
-        latents = self.norm2(latents)
-        b, l, _ = latents.shape
-
-        q = self.to_q(latents)
-        kv_input = torch.cat((x, latents), dim=-2)
-        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
-
-        q = _reshape_heads(q, self.heads)
-        k = _reshape_heads(k, self.heads)
-        v = _reshape_heads(v, self.heads)
-
-        scale = 1.0 / math.sqrt(math.sqrt(self.dim_head))
-        weight = (q * scale) @ (k * scale).transpose(-2, -1)
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
-        out = weight @ v
-        out = out.permute(0, 2, 1, 3).reshape(b, l, -1)
-        return self.to_out(out)
-
-
-class Resampler(nn.Module):
-    """IP-Adapter-Plus Resampler: CLIP patch tokens -> num_queries IP tokens at cross_attention_dim.
-
-    Input:  (B, N_patches, embedding_dim)  -- typically CLIP hidden_states[-2]
-    Output: (B, num_queries, output_dim)   -- IP tokens consumed by IPAttnProcessor
-    """
-
-    def __init__(
-        self,
-        dim=1024,
-        depth=4,
-        dim_head=64,
-        heads=16,
-        num_queries=16,
-        embedding_dim=1280,
-        output_dim=1024,
-        ff_mult=4,
-    ):
-        super().__init__()
-        self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim ** 0.5)
-        self.proj_in = nn.Linear(embedding_dim, dim)
-        self.proj_out = nn.Linear(dim, output_dim)
-        self.norm_out = nn.LayerNorm(output_dim)
-
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(
-                nn.ModuleList([
-                    PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
-                    _ff(dim, mult=ff_mult),
-                ])
-            )
-
-    def forward(self, x):
-        latents = self.latents.repeat(x.size(0), 1, 1)
-        x = self.proj_in(x)
-        for attn, ff in self.layers:
-            latents = attn(x, latents) + latents
-            latents = ff(latents) + latents
-        latents = self.proj_out(latents)
-        return self.norm_out(latents)
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
@@ -240,28 +130,28 @@ class IPAdapter(torch.nn.Module):
         super().__init__()
         self.image_proj_model = image_proj_model
         self.adapter_modules = adapter_modules
-
+        
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
-
+    
     def load_from_checkpoint(self, ckpt_path: str):
         state_dict = torch.load(ckpt_path, map_location="cpu")
-
+        
         # Load state dict for image_proj_model and adapter_modules
         self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
         self.adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
-
+        
         logger.info(f"Successfully loaded pretrained IP-Adapter weights from checkpoint {ckpt_path}")
-
+    
     def forward(self, encoder_hidden_states, image_embeds):
         ip_tokens = self.image_proj_model(image_embeds)
         encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         return encoder_hidden_states, ip_tokens
 
 
-class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipeline):
+class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
 
-    def load_ip_adapter(self, model_ckpt: str, clip_embeddings_dim: int = 1280, num_tokens: int = 16, scale: float = 1.0):
+    def load_ip_adapter(self, model_ckpt: str, clip_embeddings_dim: int = 1024, num_tokens: int = 4, scale: float = 1.0):
         self.set_image_proj_model(clip_embeddings_dim, num_tokens)
         ip_adapter_modules = self.set_ip_adapter(num_tokens, scale)
 
@@ -271,31 +161,25 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
             ckpt_path=model_ckpt
         )
 
-    def set_image_proj_model(self, clip_embeddings_dim: int = 1280, num_tokens: int = 16):
-        cross_attention_dim = self.unet.config.cross_attention_dim
-        image_proj_model = Resampler(
-            dim=cross_attention_dim,
-            depth=4,
-            dim_head=64,
-            heads=16,
-            num_queries=num_tokens,
-            embedding_dim=clip_embeddings_dim,
-            output_dim=cross_attention_dim,
-            ff_mult=4,
+    def set_image_proj_model(self, clip_embeddings_dim: int = 1024, num_tokens: int = 4):
+        image_proj_model = ImageProjModel(
+            cross_attention_dim=self.unet.config.cross_attention_dim,
+            clip_embeddings_dim=clip_embeddings_dim,
+            clip_extra_context_tokens=num_tokens,
         )
 
         image_proj_model.eval()
         self.image_proj_model = image_proj_model.to(self.unet.device).to(self.unet.dtype)
 
         self._clip_embeddings_dim = clip_embeddings_dim
-
-    def set_ip_adapter(self, num_tokens: int = 16, scale: float = 1.0):
+    
+    def set_ip_adapter(self, num_tokens: int = 4, scale: float = 1.0):
         # Check if UNet already has IP-Adapter processors (from validation)
         has_ip_adapter_processors = all(
-            isinstance(proc, IPAttnProcessor) for name, proc in self.unet.attn_processors.items()
+            isinstance(proc, IPAttnProcessor) for name, proc in self.unet.attn_processors.items() 
             if not name.endswith("attn1.processor")
         )
-
+        
         if not has_ip_adapter_processors:
             # Create new IP-Adapter processors only if UNet doesn't have them
             unet = self.unet
@@ -322,17 +206,17 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
                         "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
                     }
                     attn_procs[name] = IPAttnProcessor(
-                        hidden_size=hidden_size,
+                        hidden_size=hidden_size, 
                         cross_attention_dim=cross_attention_dim,
                         scale=scale,
                         num_tokens=num_tokens
                     ).to(unet.device, dtype=unet.dtype)
                     attn_procs[name].load_state_dict(weights)
             unet.set_attn_processor(attn_procs)
-
+            
         ip_adapter_modules = torch.nn.ModuleList(self.unet.attn_processors.values())
         return ip_adapter_modules
-
+    
     def set_ip_adapter_scale(self, scale: float):
         for attn_processor in self.unet.attn_processors.values():
             if hasattr(attn_processor, 'scale'):
@@ -372,17 +256,16 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
             callback_on_step_end_tensor_inputs,
         )
 
-        # Validate cloth CLIP patch embeddings
+        # Validate cloth CLIP image embeddings
         if image_embeds is None:
             raise ValueError(
-                "`image_embeds` must be provided for StableDiffusionTryOnClipResamplerPipeline. "
-                "Please encode the cloth image with a CLIP vision encoder and pass the penultimate-layer patch tokens "
-                "(e.g. `image_encoder(pixel_values, output_hidden_states=True).hidden_states[-2]`)."
+                "`image_embeds` must be provided for StableDiffusionIDControlPipeline. "
+                "Please encode the cloth image with a CLIP vision encoder and pass the projected embeddings."
             )
 
         if not isinstance(image_embeds, torch.Tensor):
             raise ValueError(f"`image_embeds` must be a torch.Tensor, but got {type(image_embeds)}")
-
+        
         if mask_image is not None:
             if self.unet.config.in_channels != 4:
                 raise ValueError(f"Inpainting is only supported for UNet with 4 input channels, but got {self.unet.config.in_channels}. ")
@@ -410,13 +293,12 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
         do_classifier_free_guidance: bool,
     ) -> torch.Tensor:
         """
-        Expand cloth CLIP patch embeddings (B, N, D) to match the batch size and number of images per prompt.
+        Expand cloth CLIP image embeddings to match the batch size and number of images per prompt.
         Handle CFG if enabled.
         """
         if image_embeds.shape[0] == 1:
-            # Resampler input is 3D (B, N, D) -- repeat along batch only.
-            repeat_sizes = [batch_size * num_images_per_prompt] + [1] * (image_embeds.dim() - 1)
-            image_embeds = image_embeds.repeat(*repeat_sizes)
+            repeats = [batch_size * num_images_per_prompt] + [1] * (image_embeds.ndim - 1)
+            image_embeds = image_embeds.repeat(*repeats)
         elif image_embeds.shape[0] != batch_size:
             raise ValueError(
                 f"Image embeds batch size ({image_embeds.shape[0]}) must match prompt batch size ({batch_size})"
@@ -591,7 +473,7 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-
+        
         ip_adapter_scale: Optional[float] = None,
         **kwargs,
     ):
@@ -603,41 +485,117 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             control_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.Tensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The ControlNet input condition to provide guidance to the `unet` for generation.
+                The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
+                specified as `torch.Tensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be accepted
+                as an image. The dimensions of the output image defaults to `control_image`'s dimensions. If height and/or
+                width are passed, `control_image` is resized accordingly. If multiple ControlNets are specified in `init`,
+                images must be passed as a list such that each element of the list can be correctly batched for input
+                to a single ControlNet. When `prompt` is a list, and if a list of images is passed for a single
+                ControlNet, each will be paired with each prompt in the `prompt` list. This also applies to multiple
+                ControlNets, where a list of image lists can be passed to batch for each prompt and each ControlNet.
             image_embeds (`torch.Tensor`):
-                Cloth image CLIP patch embeddings (penultimate `hidden_states[-2]`, shape `(B, N_patches, D)`) used
-                as input to the Resampler IP-Adapter-Plus projection head.
-            mask_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, ...):
-                Optional inpainting mask. White pixels are repainted; black pixels are preserved.
-            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, ..., *optional*):
-                Source image for inpainting. Required when `mask_image` is provided.
-            height/width (`int`, *optional*):
-                Output image size; defaults to `self.unet.config.sample_size * self.vae_scale_factor`.
-            num_inference_steps (`int`, *optional*, defaults to 50): Number of denoising steps.
-            timesteps/sigmas (`List`, *optional*): Custom timesteps/sigmas for the scheduler.
-            strength (`float`): Inpainting strength (1.0 = pure noise init).
-            guidance_scale (`float`, *optional*, defaults to 7.5): Classifier-free guidance scale.
-            negative_prompt (`str` or `List[str]`, *optional*): Negative prompt.
-            num_images_per_prompt (`int`, *optional*, defaults to 1): Images to generate per prompt.
-            eta (`float`, *optional*, defaults to 0.0): DDIM eta.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*): RNG.
-            latents (`torch.Tensor`, *optional*): Pre-generated noise latents.
-            prompt_embeds/negative_prompt_embeds (`torch.Tensor`, *optional*): Pre-computed text embeddings.
-            output_type (`str`): `"pil"` or `"np.array"`.
-            return_dict (`bool`, *optional*, defaults to `True`): Return pipeline output dataclass if True.
-            cross_attention_kwargs (`dict`, *optional*): Passed to `AttentionProcessor`.
-            controlnet_conditioning_scale (`float` or `List[float]`, defaults to 1.0): ControlNet scale.
-            guess_mode (`bool`, defaults to `False`): ControlNet guess mode.
-            control_guidance_start/end (`float` or `List[float]`): Step range where ControlNet applies.
-            clip_skip (`int`, *optional*): Skip last N CLIP text layers.
-            callback_on_step_end: Per-step callback.
-            callback_on_step_end_tensor_inputs: Tensor names to pass to the callback.
-            ip_adapter_scale (`float`, *optional*): Override the current IPAttnProcessor scale.
+                Cloth image CLIP embeddings (output of `CLIPVisionModelWithProjection.image_embeds`) to use for the IP-Adapter.
+            mask_image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`,
+                    `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+                `Image`, NumPy array or tensor representing an image batch to mask `image`. White pixels in the mask
+                are repainted while black pixels are preserved. If `mask_image` is a PIL image, it is converted to a
+                single channel (luminance) before use. If it's a NumPy array or PyTorch tensor, it should contain one
+                color channel (L) instead of 3, so the expected shape for PyTorch tensor would be `(B, 1, H, W)`, `(B,
+                H, W)`, `(1, H, W)`, `(H, W)`. And for NumPy array, it would be for `(B, H, W, 1)`, `(B, H, W)`, `(H,
+                W, 1)`, or `(H, W)`.
+            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`,
+                    `List[PIL.Image.Image]`, or `List[np.ndarray]`, *optional*):
+                `Image`, NumPy array or tensor representing an image batch to be used as the starting point for inpainting.
+                This is the source image that will be inpainted. Required when `mask_image` is provided. For both
+                NumPy array and PyTorch tensor, the expected value range is between `[0, 1]`. If it's a tensor or a
+                list or tensors, the expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a NumPy array or
+                a list of arrays, the expected shape should be `(B, H, W, C)` or `(H, W, C)`. It can also accept image
+                latents as `image`, but if passing latents directly it is not encoded again.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
+                in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
+                passed will be used. Must be in descending order.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
+                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
+                will be used.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) from the [DDIM](https://huggingface.co/papers/2010.02502) paper. Only
+                applies to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
+            latents (`torch.Tensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
+            negative_prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.Tensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
+                The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added
+                to the residual in the original `unet`. If multiple ControlNets are specified in `init`, you can set
+                the corresponding scale as a list.
+            guess_mode (`bool`, *optional*, defaults to `False`):
+                The ControlNet encoder tries to recognize the content of the input image even if you remove all
+                prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
+            control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
+                The percentage of total steps at which the ControlNet starts applying.
+            control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
+                The percentage of total steps at which the ControlNet stops applying.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+            callback_on_step_end (`Callable`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
+                A function or a subclass of `PipelineCallback` or `MultiPipelineCallbacks` that is called at the end of
+                each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
+                DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
+                list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
 
         Examples:
 
         Returns:
-            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated images and the
+                second element is a list of `bool`s indicating whether the corresponding generated image contains
+                "not-safe-for-work" (nsfw) content.
         """
 
         callback = kwargs.pop("callback", None)
@@ -773,11 +731,11 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
                 image, height=height, width=width
             )
             init_image = init_image.to(dtype=torch.float32)
-
+            
             mask = self.mask_processor.preprocess(
                 mask_image, height=height, width=width
             )
-
+            
             masked_image = init_image * (mask < 0.5)
             _, _, height, width = init_image.shape
 
@@ -827,7 +785,7 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
 
         # 5. Prepare timesteps
         from diffusers.pipelines.controlnet.pipeline_controlnet import retrieve_timesteps
-
+        
         if mask_image is not None:
             # Copied from diffusers/pipelines/controlnet/pipeline_controlnet_inpaint.py
             self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -847,7 +805,7 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         num_channels_unet = self.unet.config.in_channels
-
+        
         if mask_image is not None:
             return_image_latents = num_channels_unet == 4
             latents_outputs = self.prepare_latents(
@@ -865,12 +823,12 @@ class StableDiffusionTryOnClipResamplerPipeline(StableDiffusionControlNetPipelin
                 return_noise=True,
                 return_image_latents=return_image_latents,
             )
-
+            
             if return_image_latents:
                 latents, noise, image_latents = latents_outputs
             else:
                 latents, noise = latents_outputs
-
+            
             mask, masked_image_latents = self.prepare_mask_latents(
                 mask,
                 masked_image,
