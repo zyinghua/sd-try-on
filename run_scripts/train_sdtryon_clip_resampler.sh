@@ -1,7 +1,7 @@
 #!/bin/bash
 
-source /etc/network_turbo
-export HF_HUB_DISABLE_XET=1
+# source /etc/network_turbo
+# export HF_HUB_DISABLE_XET=1
 
 accelerate launch train_clip_resampler.py \
     --pretrained_model_name_or_path "Manojb/stable-diffusion-2-1-base" \
@@ -19,7 +19,7 @@ accelerate launch train_clip_resampler.py \
     --checkpoints_total_limit 20 \
     --validation_steps 500 \
     --validation_prompt "A female wearing a white T-shirt with a red LEVI's logo." "A female wearing a black T-shirt with white logo and text." \
-    --validation_image "/root/autodl-tmp/data/sdtryon/train/image/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/image/00019_00.jpg" \
+    --validation_image "/root/autodl-tmp/data/sdtryon/train/image-densepose/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/image-densepose/00019_00.jpg" \
     --validation_cloth_image "/root/autodl-tmp/data/sdtryon/train/cloth/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/cloth/00019_00.jpg" \
     --ip_adapter_image_drop_rate 0.05 \
     --cloth_id_loss_weight 0.0 \
