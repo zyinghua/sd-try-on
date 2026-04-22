@@ -1,31 +1,6 @@
-#!/usr/bin/env python
 """
-Prepare a HuggingFace `datasets`-compatible `metadata.jsonl` for CLIP resampler
-training (`train_clip_resampler.py`), written in-place inside the raw VITON-HD
-split dir.
-
-Source layout (VITON-HD):
-    <data_dir>/<split>/
-        image/           XXXXX_00.jpg            target images (person wearing cloth)
-        cloth/           XXXXX_00.jpg            cloth items
-        openpose_img/    XXXXX_00_rendered.png   pose renders (default)
-        image-densepose/ XXXXX_00.jpg            densepose (alternative, --pose_source)
-
-This script writes `metadata.jsonl` directly into `<data_dir>/<split>/` with
-per-row fields (paths relative to that directory):
-    image              e.g. "image/00000_00.jpg"
-    text               caption
-    conditioning_image e.g. "openpose_img/00000_00_rendered.png"
-    cloth_image        e.g. "cloth/00000_00.jpg"
-
-The CLIP resampler trainer consumes the same 4 columns as the ControlNet
-trainer (see `preprocess_train` in `train_clip_resampler.py`), so the schema
-here matches that script's expectations. The script is kept separate from
-`prepare_control_dataset.py` so you can diverge the two recipes later
-(different captions, filters, pose source, etc.) without coupling them.
-
-After running this script, use:
-    accelerate launch train_clip_resampler.py --train_data_dir <data_dir>/<split> ...
+Prepare a HuggingFace `datasets`-compatible `metadata.jsonl` for ControlNet
+training (`train.py`).
 """
 
 import argparse
@@ -33,7 +8,7 @@ import json
 from pathlib import Path
 
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_DATA_DIR = Path("/root/autodl-tmp/data/sdtryon")
 
 
 def parse_args():
@@ -49,8 +24,6 @@ def parse_args():
                    help="Caption used for every row (VITON-HD ships no per-image captions).")
     p.add_argument("--max_samples", type=int, default=None,
                    help="If set, only emit the first N rows (quick-debug aid).")
-    p.add_argument("--overwrite", action="store_true",
-                   help="Replace existing metadata.jsonl.")
     return p.parse_args()
 
 
@@ -66,8 +39,8 @@ def main():
             raise FileNotFoundError(f"Missing source directory for '{label}': {d}")
 
     metadata_path = split_dir / "metadata.jsonl"
-    if metadata_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{metadata_path} exists; pass --overwrite to replace.")
+    if metadata_path.exists():
+        print(f"Replacing existing {metadata_path}.")
 
     image_files = sorted(p.name for p in image_src.iterdir()
                          if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
@@ -92,7 +65,7 @@ def main():
                 continue
 
             row = {
-                "image": f"image/{fname}",
+                "file_name": f"image/{fname}",
                 "text": args.caption,
                 "conditioning_image": f"{args.pose_source}/{pose_name}",
                 "cloth_image": f"cloth/{cloth_name}",
@@ -101,8 +74,6 @@ def main():
             written += 1
 
     print(f"Wrote {written} rows to {metadata_path} (skipped {skipped} with missing pair/pose).")
-    print(f"Use with: accelerate launch train_clip_resampler.py --train_data_dir {split_dir}")
-
 
 if __name__ == "__main__":
     main()
