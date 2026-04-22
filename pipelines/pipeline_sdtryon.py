@@ -14,11 +14,13 @@
 
 
 import inspect
+import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
@@ -125,6 +127,81 @@ EXAMPLE_DOC_STRING = """
 """
 
 
+def _ff(dim, mult=4):
+    inner_dim = int(dim * mult)
+    return nn.Sequential(
+        nn.LayerNorm(dim),
+        nn.Linear(dim, inner_dim, bias=False),
+        nn.GELU(),
+        nn.Linear(inner_dim, dim, bias=False),
+    )
+
+
+def _reshape_heads(x, heads):
+    b, n, _ = x.shape
+    return x.view(b, n, heads, -1).transpose(1, 2)
+
+
+class PerceiverAttention(nn.Module):
+    def __init__(self, *, dim, dim_head=64, heads=8):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.dim_head = dim_head
+        self.heads = heads
+        inner_dim = dim_head * heads
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x, latents):
+        x = self.norm1(x)
+        latents = self.norm2(latents)
+        b, l, _ = latents.shape
+
+        q = self.to_q(latents)
+        kv_input = torch.cat((x, latents), dim=-2)
+        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+
+        q = _reshape_heads(q, self.heads)
+        k = _reshape_heads(k, self.heads)
+        v = _reshape_heads(v, self.heads)
+
+        scale = 1.0 / math.sqrt(math.sqrt(self.dim_head))
+        weight = (q * scale) @ (k * scale).transpose(-2, -1)
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        out = weight @ v
+        out = out.permute(0, 2, 1, 3).reshape(b, l, -1)
+        return self.to_out(out)
+
+
+class Resampler(nn.Module):
+    def __init__(self, dim=1024, depth=4, dim_head=64, heads=16, num_queries=16,
+                 embedding_dim=1280, output_dim=1024, ff_mult=4):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim ** 0.5)
+        self.proj_in = nn.Linear(embedding_dim, dim)
+        self.proj_out = nn.Linear(dim, output_dim)
+        self.norm_out = nn.LayerNorm(output_dim)
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
+                _ff(dim, mult=ff_mult),
+            ])
+            for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        latents = self.latents.repeat(x.size(0), 1, 1)
+        x = self.proj_in(x)
+        for attn, ff in self.layers:
+            latents = attn(x, latents) + latents
+            latents = ff(latents) + latents
+        return self.norm_out(self.proj_out(latents))
+
+
 class IPAdapter(torch.nn.Module):
     def __init__(self, image_proj_model, adapter_modules, ckpt_path=None):
         super().__init__()
@@ -159,6 +236,29 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
             image_proj_model=self.image_proj_model,
             adapter_modules=ip_adapter_modules,
             ckpt_path=model_ckpt
+        )
+
+    def load_ip_adapter_clip_resampler(self, model_ckpt: str, clip_embeddings_dim: int = 1280, num_tokens: int = 16, scale: float = 1.0):
+        cross_attention_dim = self.unet.config.cross_attention_dim
+        image_proj_model = Resampler(
+            dim=cross_attention_dim,
+            depth=4,
+            dim_head=64,
+            heads=16,
+            num_queries=num_tokens,
+            embedding_dim=clip_embeddings_dim,
+            output_dim=cross_attention_dim,
+            ff_mult=4,
+        )
+        image_proj_model.eval()
+        self.image_proj_model = image_proj_model.to(self.unet.device).to(self.unet.dtype)
+        self._clip_embeddings_dim = clip_embeddings_dim
+
+        ip_adapter_modules = self.set_ip_adapter(num_tokens, scale)
+        self.ip_adapter = IPAdapter(
+            image_proj_model=self.image_proj_model,
+            adapter_modules=ip_adapter_modules,
+            ckpt_path=model_ckpt,
         )
 
     def set_image_proj_model(self, clip_embeddings_dim: int = 1024, num_tokens: int = 4):
