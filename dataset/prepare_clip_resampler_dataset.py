@@ -17,7 +17,7 @@ def parse_args():
                    help=f"Raw VITON-HD dataset root. Default: {DEFAULT_DATA_DIR}")
     p.add_argument("--split", choices=["train", "test"], default="train",
                    help="Which split of the VITON-HD layout to prepare. Default: train")
-    p.add_argument("--pose_source", choices=["openpose_img", "image-densepose"], default="openpose_img",
+    p.add_argument("--pose_source", choices=["openpose_img", "image-densepose"], default="image-densepose",
                    help="Which pose representation to use. Default: openpose_img")
     p.add_argument("--caption", type=str,
                    default="a person wearing a garment",
