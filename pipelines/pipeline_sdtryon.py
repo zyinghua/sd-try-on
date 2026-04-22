@@ -297,7 +297,8 @@ class StableDiffusionIDControlPipeline(StableDiffusionControlNetPipeline):
         Handle CFG if enabled.
         """
         if image_embeds.shape[0] == 1:
-            image_embeds = image_embeds.repeat(batch_size * num_images_per_prompt, 1)
+            repeats = [batch_size * num_images_per_prompt] + [1] * (image_embeds.ndim - 1)
+            image_embeds = image_embeds.repeat(*repeats)
         elif image_embeds.shape[0] != batch_size:
             raise ValueError(
                 f"Image embeds batch size ({image_embeds.shape[0]}) must match prompt batch size ({batch_size})"
