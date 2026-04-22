@@ -222,6 +222,44 @@ class IPAdapter(torch.nn.Module):
         return encoder_hidden_states, ip_tokens
 
 
+def one_step_clean_pixel_extraction(model_pred, noisy_latents, timesteps, noise_scheduler, vae, use_fixed_timestep):
+    """One-step x0 estimate -> VAE-decoded pixel image in [0, 1]."""
+    if noise_scheduler.config.prediction_type != "epsilon":
+        raise ValueError(
+            f"one_step_clean_pixel_extraction: unsupported prediction type "
+            f"{noise_scheduler.config.prediction_type}"
+        )
+
+    if use_fixed_timestep:
+        pred_original_sample = noise_scheduler.step(
+            model_output=model_pred, timestep=timesteps, sample=noisy_latents, return_dict=False,
+        )[0]
+    else:
+        alpha_cumprod_t = noise_scheduler.alphas_cumprod[timesteps].to(
+            device=noisy_latents.device, dtype=noisy_latents.dtype
+        ).view(-1, 1, 1, 1)
+        pred_original_sample = (
+            noisy_latents - ((1 - alpha_cumprod_t) ** 0.5) * model_pred
+        ) / (alpha_cumprod_t ** 0.5)
+
+    scaled_latents = pred_original_sample / vae.config.scaling_factor
+    decoded = vae.decode(scaled_latents, return_dict=False)[0]
+    pred_x0 = (decoded / 2 + 0.5).clamp(0, 1)  # (B, 3, H, W) in [0, 1]
+
+    return pred_x0
+
+
+def extract_cloth_clip_embedding(image_encoder, pred_x0, mask, clip_target_size, clip_image_mean, clip_image_std, weight_dtype):
+    """Mask -> CLIP preprocess (resize+normalize) -> CLIP image-embed. Differentiable."""
+    if mask.shape[-2:] != pred_x0.shape[-2:]:
+        mask = F.interpolate(mask, size=pred_x0.shape[-2:], mode="nearest")
+    masked = pred_x0 * mask  # cloth region preserved, else black
+    clip_input = F.interpolate(masked, size=(clip_target_size, clip_target_size), mode="bilinear", align_corners=False)
+    clip_input = (clip_input - clip_image_mean) / clip_image_std
+
+    return image_encoder(clip_input.to(dtype=weight_dtype)).image_embeds
+
+
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
 
@@ -819,6 +857,26 @@ def parse_args(input_args=None):
         default=16,
         help="Number of IP tokens produced by the Resampler (learned latents).",
     )
+    parser.add_argument(
+        "--cloth_mask_column",
+        type=str,
+        default="cloth_mask",
+        help=(
+            "Column of the dataset giving the cloth-region mask of the person image "
+            "(PNG, same resolution as the image, non-zero = cloth). Used only when "
+            "--cloth_id_loss_weight > 0."
+        ),
+    )
+    parser.add_argument(
+        "--cloth_id_loss_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the cloth-identity regularization. When > 0, predict x0 from "
+            "the current step, decode via VAE, mask to the cloth region, and pull its "
+            "CLIP image-embed toward the conditioning cloth's via (1 - cosine similarity)."
+        ),
+    )
 
 
     if input_args is not None:
@@ -957,6 +1015,16 @@ def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
                 f"`--cloth_image_column` value '{args.cloth_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
+    # Only wire up the cloth-mask column if the cloth-ID loss is actually enabled.
+    cloth_mask_column = None
+    if args.cloth_id_loss_weight > 0:
+        if args.cloth_mask_column not in column_names:
+            raise ValueError(
+                f"`--cloth_id_loss_weight` > 0 but '{args.cloth_mask_column}' not found in dataset "
+                f"columns: {column_names}. Re-run prepare_clip_resampler_dataset.py after generating masks."
+            )
+        cloth_mask_column = args.cloth_mask_column
+
     def tokenize_captions(examples, caption_col, is_train=True, apply_empty_prompt_dropout=True):
         """Tokenize captions from a specified column."""
         captions = []
@@ -988,6 +1056,13 @@ def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
     conditioning_image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+        ]
+    )
+
+    mask_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.NEAREST),
             transforms.ToTensor(),
         ]
     )
@@ -1028,6 +1103,17 @@ def make_train_dataset(args, tokenizer, accelerator, clip_image_processor):
         examples["cloth_pixel_values"] = cloth_pixel_values
         examples["drop_image_embeds"] = drop_image_embeds
 
+        if cloth_mask_column is not None:
+            masks = []
+            for mask_entry in examples[cloth_mask_column]:
+                if isinstance(mask_entry, str):
+                    mask_img = Image.open(Path(args.train_data_dir) / mask_entry).convert("L")
+                else:
+                    mask_img = mask_entry.convert("L")
+                mask_t = mask_transforms(mask_img)
+                masks.append((mask_t > 0.5).float())  # hard-binarize to {0, 1}
+            examples["cloth_mask_values"] = masks
+
         return examples
 
     with accelerator.main_process_first():
@@ -1053,13 +1139,19 @@ def collate_fn(examples):
     cloth_pixel_values = cloth_pixel_values.to(memory_format=torch.contiguous_format).float()
     drop_image_embeds = [example["drop_image_embeds"] for example in examples]
 
-    return {
+    batch = {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
         "cloth_pixel_values": cloth_pixel_values,
         "drop_image_embeds": drop_image_embeds,
     }
+
+    if "cloth_mask_values" in examples[0]:
+        cloth_mask_values = torch.stack([example["cloth_mask_values"] for example in examples])
+        batch["cloth_mask_values"] = cloth_mask_values.to(memory_format=torch.contiguous_format).float()
+
+    return batch
 
 
 def main(args):
@@ -1189,7 +1281,11 @@ def main(args):
                 "to_k_ip.weight": unet_sd[layer_name + ".to_k.weight"],
                 "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
             }
-            attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+            attn_procs[name] = IPAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                num_tokens=args.num_ip_tokens,
+            )
             attn_procs[name].load_state_dict(weights)
     unet.set_attn_processor(attn_procs)
     ip_adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
@@ -1385,6 +1481,25 @@ def main(args):
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
 
+    # --- Cloth-identity loss: cache CLIP preprocessing constants (only when enabled). ---
+    clip_target_size = None
+    clip_image_mean = None
+    clip_image_std = None
+    if args.cloth_id_loss_weight > 0:
+        clip_target_size = int(
+            clip_image_processor.size.get("shortest_edge", clip_image_processor.size.get("height", 224))
+        )
+        clip_image_mean = torch.tensor(
+            clip_image_processor.image_mean, device=accelerator.device
+        ).view(1, 3, 1, 1)
+        clip_image_std = torch.tensor(
+            clip_image_processor.image_std, device=accelerator.device
+        ).view(1, 3, 1, 1)
+        logger.info(
+            f"Cloth-ID loss enabled (weight={args.cloth_id_loss_weight}); "
+            f"CLIP input {clip_target_size}x{clip_target_size}."
+        )
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -1506,9 +1621,11 @@ def main(args):
                 # giving spatially-aware cloth features rather than a single pooled vector.
                 cloth_pixel_values = batch["cloth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
                 with torch.no_grad():
-                    image_embeds = image_encoder(
-                        cloth_pixel_values, output_hidden_states=True
-                    ).hidden_states[-2]
+                    cloth_clip_out = image_encoder(cloth_pixel_values, output_hidden_states=True)
+                    image_embeds = cloth_clip_out.hidden_states[-2]
+                    ref_cloth_embeds = (
+                        cloth_clip_out.image_embeds if args.cloth_id_loss_weight > 0 else None
+                    )
 
                 # Apply drop for cfg (zero out the full token sequence for dropped samples)
                 image_embeds_processed = []
@@ -1554,6 +1671,33 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # ======================= Cloth-identity regularization =======================
+                if args.cloth_id_loss_weight > 0 and "cloth_mask_values" in batch:
+                    pred_x0 = one_step_clean_pixel_extraction(
+                        model_pred=model_pred,
+                        noisy_latents=noisy_latents,
+                        timesteps=timesteps,
+                        noise_scheduler=noise_scheduler,
+                        vae=vae,
+                        use_fixed_timestep=args.use_fixed_timestep,
+                    )
+                    mask = batch["cloth_mask_values"].to(device=accelerator.device, dtype=pred_x0.dtype)
+                    pred_cloth_embeds = extract_cloth_clip_embedding(
+                        image_encoder=image_encoder,
+                        pred_x0=pred_x0,
+                        mask=mask,
+                        clip_target_size=clip_target_size,
+                        clip_image_mean=clip_image_mean.to(dtype=pred_x0.dtype),
+                        clip_image_std=clip_image_std.to(dtype=pred_x0.dtype),
+                        weight_dtype=weight_dtype,
+                    )
+                    cos_sim = F.cosine_similarity(
+                        pred_cloth_embeds.float(), ref_cloth_embeds.float(), dim=-1
+                    )
+                    cloth_id_loss = (1.0 - cos_sim).mean()
+                    loss = loss + args.cloth_id_loss_weight * cloth_id_loss
+                # ===========================================================================
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

@@ -24,6 +24,8 @@ def parse_args():
                    help="Caption used for every row (VITON-HD ships no per-image captions).")
     p.add_argument("--max_samples", type=int, default=None,
                    help="If set, only emit the first N rows (quick-debug aid).")
+    p.add_argument("--cloth_mask_dir", type=str, default="image_cloth_mask",
+                   help=("Cloth mask in person images, used for cloth clip loss."))
     return p.parse_args()
 
 
@@ -33,10 +35,14 @@ def main():
     image_src = split_dir / "image"
     cloth_src = split_dir / "cloth"
     pose_src = split_dir / args.pose_source
+    mask_src = split_dir / args.cloth_mask_dir
+    emit_mask = mask_src.is_dir()
 
     for d, label in [(image_src, "image"), (cloth_src, "cloth"), (pose_src, args.pose_source)]:
         if not d.is_dir():
             raise FileNotFoundError(f"Missing source directory for '{label}': {d}")
+    if not emit_mask:
+        print(f"Note: {mask_src} not found; skipping `cloth_mask` field.")
 
     metadata_path = split_dir / "metadata.jsonl"
     if metadata_path.exists():
@@ -70,6 +76,10 @@ def main():
                 "conditioning_image": f"{args.pose_source}/{pose_name}",
                 "cloth_image": f"cloth/{cloth_name}",
             }
+            if emit_mask:
+                mask_name = f"{stem}.png"
+                if (mask_src / mask_name).exists():
+                    row["cloth_mask"] = f"{args.cloth_mask_dir}/{mask_name}"
             f.write(json.dumps(row) + "\n")
             written += 1
 
