@@ -1564,24 +1564,27 @@ def main(args):
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            # Support both absolute paths (resume from a different folder) and
+            # bare checkpoint names (resume from within --output_dir).
+            if os.path.isabs(args.resume_from_checkpoint):
+                ckpt_path = args.resume_from_checkpoint
+            else:
+                ckpt_path = os.path.join(args.output_dir, args.resume_from_checkpoint)
         else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            ckpt_path = os.path.join(args.output_dir, dirs[-1]) if dirs else None
 
-        if path is None:
+        if ckpt_path is None or not os.path.isdir(ckpt_path):
             accelerator.print(
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
+            accelerator.print(f"Resuming from checkpoint {ckpt_path}")
+            accelerator.load_state(ckpt_path)
+            global_step = int(os.path.basename(ckpt_path).split("-")[1])
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
