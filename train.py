@@ -69,7 +69,7 @@ else:
 import sys
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(script_dir, "scripts"))
-from pipelines.pipeline_faceswap import StableDiffusionIDControlPipeline
+from pipelines.pipeline_sdtryon import StableDiffusionIDControlPipeline
 
 if is_wandb_available():
     import wandb
@@ -1294,6 +1294,12 @@ def main(args):
         tracker_config.pop("validation_image")
         tracker_config.pop("validation_cloth_image")
 
+        # tensorboard's add_hparams only accepts int/float/str/bool/torch.Tensor;
+        # stringify anything else (e.g. resolution tuple, None).
+        for _k, _v in list(tracker_config.items()):
+            if not isinstance(_v, (int, float, str, bool)):
+                tracker_config[_k] = str(_v)
+
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     # Train!
@@ -1395,7 +1401,11 @@ def main(args):
                         image_embeds_processed.append(image_embed)
                 image_embeds = torch.stack(image_embeds_processed)
 
-                encoder_hidden_states, controlnet_encoder_hidden_states = ip_adapter(encoder_hidden_states, image_embeds)
+                ip_dtype = next(ip_adapter.parameters()).dtype
+                encoder_hidden_states, controlnet_encoder_hidden_states = ip_adapter(
+                    encoder_hidden_states.to(dtype=ip_dtype),
+                    image_embeds.to(dtype=ip_dtype),
+                )
                 # ======================= IP-Adapter =========================
 
                 down_block_res_samples, mid_block_res_sample = controlnet(

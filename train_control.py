@@ -1534,6 +1534,12 @@ def main(args):
         tracker_config.pop("validation_image")
         tracker_config.pop("validation_cloth_image")
 
+        # tensorboard's add_hparams only accepts int/float/str/bool/torch.Tensor;
+        # stringify anything else (e.g. resolution tuple, None).
+        for _k, _v in list(tracker_config.items()):
+            if not isinstance(_v, (int, float, str, bool)):
+                tracker_config[_k] = str(_v)
+
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     # Train!

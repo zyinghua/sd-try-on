@@ -1,9 +1,9 @@
 #!/bin/bash
 
-source /etc/network_turbo
-export HF_HUB_DISABLE_XET=1
+# source /etc/network_turbo
+# export HF_HUB_DISABLE_XET=1
 
-accelerate launch train_clip_resampler.py \
+accelerate launch train_control.py \
     --pretrained_model_name_or_path "Manojb/stable-diffusion-2-1-base" \
     --image_encoder_path "patrickjohncyh/fashion-clip" \
     --conditioning_channels 3 \
