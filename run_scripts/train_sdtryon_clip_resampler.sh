@@ -22,4 +22,5 @@ accelerate launch train_clip_resampler.py \
     --validation_image "/root/autodl-tmp/data/sdtryon/train/image/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/image/00019_00.jpg" \
     --validation_cloth_image "/root/autodl-tmp/data/sdtryon/train/cloth/00000_00.jpg" "/root/autodl-tmp/data/sdtryon/train/cloth/00019_00.jpg" \
     --ip_adapter_image_drop_rate 0.05 \
+    --cloth_id_loss_weight 0.0 \
     #--pretrained_ip_adapter_path "/path/to/pretrained_ip_adapter.bin" \
