@@ -250,11 +250,22 @@ def one_step_clean_pixel_extraction(model_pred, noisy_latents, timesteps, noise_
 
 
 def extract_cloth_clip_embedding(image_encoder, pred_x0, mask, clip_target_size, clip_image_mean, clip_image_std, weight_dtype):
-    """Mask -> CLIP preprocess (resize+normalize) -> CLIP image-embed. Differentiable."""
+    """Mask -> CLIP preprocess (resize+normalize) -> CLIP image-embed. Differentiable.
+
+    Mirrors CLIPImageProcessor: aspect-preserving bicubic resize with shortest edge
+    = clip_target_size, then center-crop to a square.
+    """
     if mask.shape[-2:] != pred_x0.shape[-2:]:
         mask = F.interpolate(mask, size=pred_x0.shape[-2:], mode="nearest")
     masked = pred_x0 * mask  # cloth region preserved, else black
-    clip_input = F.interpolate(masked, size=(clip_target_size, clip_target_size), mode="bilinear", align_corners=False)
+
+    h, w = masked.shape[-2:]
+    scale = clip_target_size / min(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    resized = F.interpolate(masked, size=(new_h, new_w), mode="bicubic", antialias=True, align_corners=False)
+    top = (new_h - clip_target_size) // 2
+    left = (new_w - clip_target_size) // 2
+    clip_input = resized[..., top:top + clip_target_size, left:left + clip_target_size]
     clip_input = (clip_input - clip_image_mean) / clip_image_std
 
     return image_encoder(clip_input.to(dtype=weight_dtype)).image_embeds
