@@ -16,13 +16,15 @@ from pipelines.pipeline_sdtryon import StableDiffusionIDControlPipeline
 #   "control":        ImageProjModel (train.py), CLIP projected image_embeds
 MODE = "clip_resampler"
 
+IMAGE_ID = "00025"
+
 BASE_MODEL = "Manojb/stable-diffusion-2-1-base"
 IMAGE_ENCODER_PATH = "patrickjohncyh/fashion-clip"
 CONTROLNET_PATH = "/root/autodl-tmp/sdtryon-model/checkpoint-30000/controlnet"                  # ends with /controlnet
 IP_ADAPTER_PATH = "/root/autodl-tmp/sdtryon-model/checkpoint-30000/ip_adapter/ip_adapter.bin"   # ends with /ip_adapter/ip_adapter.bin
 
-POSE_IMAGE = "/root/autodl-tmp/data/sdtryon/train/image-densepose/00000_00.jpg"
-CLOTH_IMAGE = "/root/autodl-tmp/data/sdtryon/train/cloth/00000_00.jpg"
+POSE_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image-densepose/{IMAGE_ID}_00.jpg"
+CLOTH_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/cloth/{IMAGE_ID}_00.jpg"
 PROMPT = "a person wearing a garment"
 NEGATIVE_PROMPT = "noisy, blurry, low contrast, watermark, painting, drawing, illustration, glitch, deformed, mutated, ugly, disfigured"
 
