@@ -440,12 +440,15 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         return_dict: bool = True,
         controlnet_conditioning_scale: float = 1.0,
     ):
-        device = self._execution_device
+        # device = self._execution_device
         # Use the UNet body's dtype as the pipeline dtype; conv_in may be fp32
         # (trainable) so reading from conv_in would not be representative.
         try:
-            dtype = next(self.unet.down_blocks.parameters()).dtype
+            first_param = next(self.unet.down_blocks.parameters())
+            device = first_param.device
+            dtype = first_param.dtype
         except StopIteration:
+            device = self.unet.device
             dtype = self.unet.dtype
 
         # Resolve image size
