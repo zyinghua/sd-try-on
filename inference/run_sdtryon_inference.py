@@ -25,6 +25,9 @@ IP_ADAPTER_PATH = "/root/autodl-tmp/sdtryon-model/checkpoint-30000/ip_adapter/ip
 
 POSE_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image-densepose/{IMAGE_ID}_00.jpg"
 CLOTH_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/cloth/{IMAGE_ID}_00.jpg"
+SOURCE_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image/{IMAGE_ID}_00.jpg"
+MASK_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image_cloth_mask/{IMAGE_ID}_00.png"
+
 PROMPT = "a person wearing a garment"
 NEGATIVE_PROMPT = "noisy, blurry, low contrast, watermark, painting, drawing, illustration, glitch, deformed, mutated, ugly, disfigured"
 
@@ -73,6 +76,12 @@ def main():
         if not p or not os.path.exists(p):
             raise FileNotFoundError(f"{label} not found: {p}")
 
+    use_mask = bool(SOURCE_IMAGE) and bool(MASK_IMAGE)
+    if use_mask:
+        for label, p in [("SOURCE_IMAGE", SOURCE_IMAGE), ("MASK_IMAGE", MASK_IMAGE)]:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"{label} not found: {p}")
+
     print(f"MODE: {MODE}")
     print(f"Loading ControlNet from: {CONTROLNET_PATH}")
     print(f"Loading IP-Adapter from: {IP_ADAPTER_PATH}")
@@ -116,6 +125,10 @@ def main():
     # 4. Inputs
     pose_image = load_image(POSE_IMAGE)
     cloth_image = load_image(CLOTH_IMAGE)
+    source_image = load_image(SOURCE_IMAGE) if use_mask else None
+    mask_image = load_image(MASK_IMAGE) if use_mask else None
+    if use_mask:
+        print(f"Inpainting mode: source={SOURCE_IMAGE}, mask={MASK_IMAGE}")
     device = pipe._execution_device
 
     image_encoder = image_encoder.to(device)
@@ -133,7 +146,7 @@ def main():
     generator = torch.Generator(device="cpu").manual_seed(SEED) if SEED is not None else None
 
     print(f"Generating {SAMPLE_NUM} sample(s)...")
-    images = pipe(
+    pipe_kwargs = dict(
         prompt=prompts,
         negative_prompt=negatives,
         control_image=pose_image,
@@ -142,7 +155,11 @@ def main():
         guidance_scale=GUIDANCE_SCALE,
         controlnet_conditioning_scale=CONTROLNET_CONDITIONING_SCALE,
         generator=generator,
-    ).images
+    )
+    if use_mask:
+        pipe_kwargs["image"] = source_image
+        pipe_kwargs["mask_image"] = mask_image
+    images = pipe(**pipe_kwargs).images
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     for i, img in enumerate(images):
