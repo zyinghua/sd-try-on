@@ -201,49 +201,70 @@ class CrossAttnZeroConvBlock(nn.Module):
         x = self.transformer(x, ctx)
         x = x.transpose(1, 2).reshape(B, -1, H, W)   # (B, inner, H, W)
         x = self.proj_out(x)                          # zero at init -> 0
-        x = x + residual                              # inner residual (StableVITON's x_in add);
-                                                     # ensures zero_conv sees non-zero input,
-                                                     # so its weight gradient is non-zero at step 0
+        x = x + residual                              # inner residual: ensures zero_conv sees
+                                                     # non-zero input so its weight gradient is
+                                                     # non-zero at step 0
         x = self.zero_conv(x)                         # zero at init; learns from step 1 onward
         return residual + x
 
 
 class UNetWithClothInjection(nn.Module):
-    """Wraps a UNet2DConditionModel with a CrossAttnZeroConvBlock per up_block."""
+    """Wraps a UNet2DConditionModel with one CrossAttnZeroConvBlock per resnet
+    in up_blocks[1..L-1]; the lowest-res up_blocks[0] is skipped."""
 
-    def __init__(self, unet, cloth_context_channels_per_level):
+    def __init__(self, unet):
         super().__init__()
         self.unet = unet
-        up_block_out_channels = list(reversed(unet.config.block_out_channels))
 
-        assert len(cloth_context_channels_per_level) == len(up_block_out_channels), (
-            f"need one context-channel count per up_block: got "
-            f"{len(cloth_context_channels_per_level)}, expected {len(up_block_out_channels)}"
-        )
+        boc = list(unet.config.block_out_channels)
+        L = len(boc)
+        up_hidden = list(reversed(boc))  # per up_block output channels
+        layers_per_block = unet.config.layers_per_block
+        self._resnets_per_up_block = layers_per_block + 1
 
-        self.cloth_inject_blocks = nn.ModuleList([
-            CrossAttnZeroConvBlock(hidden_size=ch, context_channels=ctx)
-            for ch, ctx in zip(up_block_out_channels, cloth_context_channels_per_level)
-        ])
+        self.cloth_inject_blocks = nn.ModuleList()
+        # Skip up_blocks[0] (lowest-res), inject on every resnet of up_blocks[1..L-1].
+        for up_idx in range(1, L):
+            hidden = up_hidden[up_idx]
+            for r_idx in range(self._resnets_per_up_block):
+                # Pop order within this up_block: first `layers_per_block` resnets
+                # consume same-level skip; last resnet consumes one level shallower.
+                if r_idx < self._resnets_per_up_block - 1:
+                    ctx_level = L - 1 - up_idx
+                else:
+                    ctx_level = max(L - 2 - up_idx, 0)
+                ctx = boc[ctx_level]
+                self.cloth_inject_blocks.append(
+                    CrossAttnZeroConvBlock(hidden_size=hidden, context_channels=ctx)
+                )
+
         self._cloth_feats = None
         self._hook_handles = []
         self._register_hooks()
 
     def _register_hooks(self):
         outer = self
-        for idx, (up_block, inj) in enumerate(zip(self.unet.up_blocks, self.cloth_inject_blocks)):
-            def make_hook(i, inj_ref):
-                def hook(module, inputs, output):
-                    feats = outer._cloth_feats
-                    if feats is None:
-                        return output
-                    cloth = feats[i]
-                    if cloth is None:
-                        return output
-                    return inj_ref(output, cloth)
-                return hook
-            h = up_block.register_forward_hook(make_hook(idx, inj))
-            self._hook_handles.append(h)
+        L = len(self.unet.config.block_out_channels)
+        flat = 0
+        for up_idx in range(1, L):
+            up_block = self.unet.up_blocks[up_idx]
+            for r_idx in range(self._resnets_per_up_block):
+                inj = self.cloth_inject_blocks[flat]
+
+                def make_hook(i, inj_ref):
+                    def hook(module, inputs, output):
+                        feats = outer._cloth_feats
+                        if feats is None:
+                            return output
+                        cloth = feats[i]
+                        if cloth is None:
+                            return output
+                        return inj_ref(output, cloth)
+                    return hook
+
+                h = up_block.resnets[r_idx].register_forward_hook(make_hook(flat, inj))
+                self._hook_handles.append(h)
+                flat += 1
 
     def set_cloth(self, feats_per_level):
         self._cloth_feats = feats_per_level
@@ -255,29 +276,10 @@ class UNetWithClothInjection(nn.Module):
         return self.unet(*args, **kwargs)
 
 
-def compute_cloth_context_channels(unet):
-    boc = list(unet.config.block_out_channels)
-    L = len(boc)
-    out = []
-    for i in range(L):
-        level = (L - 2 - i) if i < L - 1 else 0
-        out.append(boc[level])
-    return out
-
-
-def select_cloth_feats_for_up_blocks(down_block_res_samples, mid_block_res_sample, latent_shape, num_levels):
-    all_feats = list(down_block_res_samples) + [mid_block_res_sample]
-    _, _, lh, lw = latent_shape
-    picked = []
-    for i in range(num_levels):
-        shift = (num_levels - 2 - i) if i < num_levels - 1 else 0
-        th, tw = lh // (2 ** shift), lw // (2 ** shift)
-        chosen = None
-        for f in all_feats:
-            if f.shape[-2] == th and f.shape[-1] == tw:
-                chosen = f  # keep updating; last match = deepest in the pyramid
-        picked.append(chosen)
-    return picked
+def select_cloth_feats_for_up_blocks(down_block_res_samples, layers_per_block=2):
+    """Return cloth-context feats in UNet pop order, one per injection site."""
+    skip = layers_per_block + 1
+    return list(reversed(down_block_res_samples))[skip:]
 
 
 def patch_unet_conv_in(unet, new_in_channels):
@@ -1297,10 +1299,7 @@ def main(args):
     patch_unet_conv_in(unet, new_in_channels=unet.config.in_channels + pose_latent_channels)
     pose_encoder = PoseEncoder(in_channels=3, out_channels=pose_latent_channels)
 
-    cloth_context_channels_per_level = compute_cloth_context_channels(unet)
-    unet_wrapped = UNetWithClothInjection(
-        unet, cloth_context_channels_per_level=cloth_context_channels_per_level,
-    )
+    unet_wrapped = UNetWithClothInjection(unet)
 
     # Optional IP-Adapter branch
     ip_adapter = None
@@ -1643,10 +1642,9 @@ def main(args):
                     controlnet_cond=cloth_pixels,
                     return_dict=False,
                 )
-                num_up_blocks = len(unet.config.block_out_channels)
                 cloth_feats_per_level = select_cloth_feats_for_up_blocks(
-                    down_block_res_samples, mid_block_res_sample,
-                    noisy_latents.shape, num_levels=num_up_blocks,
+                    down_block_res_samples,
+                    layers_per_block=unet.config.layers_per_block,
                 )
                 cloth_feats_per_level = [
                     f.to(dtype=weight_dtype) if f is not None else None

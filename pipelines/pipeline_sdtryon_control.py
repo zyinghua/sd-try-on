@@ -197,34 +197,10 @@ class CrossAttnZeroConvBlock(nn.Module):
         return residual + x
 
 
-def compute_cloth_context_channels(unet: UNet2DConditionModel) -> List[int]:
-    boc = list(unet.config.block_out_channels)
-    L = len(boc)
-    out = []
-    for i in range(L):
-        level = (L - 2 - i) if i < L - 1 else 0
-        out.append(boc[level])
-    return out
-
-
-def select_cloth_feats_for_up_blocks(
-    down_block_res_samples,
-    mid_block_res_sample,
-    latent_shape,
-    num_levels: int,
-):
-    all_feats = list(down_block_res_samples) + [mid_block_res_sample]
-    _, _, lh, lw = latent_shape
-    picked = []
-    for i in range(num_levels):
-        shift = (num_levels - 2 - i) if i < num_levels - 1 else 0
-        th, tw = lh // (2 ** shift), lw // (2 ** shift)
-        chosen = None
-        for f in all_feats:
-            if f.shape[-2] == th and f.shape[-1] == tw:
-                chosen = f
-        picked.append(chosen)
-    return picked
+def select_cloth_feats_for_up_blocks(down_block_res_samples, layers_per_block: int = 2):
+    """Cloth-context feats in UNet pop order, one per injection site."""
+    skip = layers_per_block + 1
+    return list(reversed(down_block_res_samples))[skip:]
 
 
 class IPAdapter(nn.Module):
@@ -301,24 +277,34 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
             h.remove()
         self._hook_handles = []
 
-        assert len(self.cloth_inject_blocks) == len(self.unet.up_blocks), (
+        L = len(self.unet.config.block_out_channels)
+        layers_per_block = self.unet.config.layers_per_block
+        resnets_per_up_block = layers_per_block + 1
+        expected = (L - 1) * resnets_per_up_block
+        assert len(self.cloth_inject_blocks) == expected, (
             f"cloth_inject_blocks ({len(self.cloth_inject_blocks)}) must equal "
-            f"unet.up_blocks ({len(self.unet.up_blocks)})"
+            f"(L-1) * (layers_per_block+1) = {expected}"
         )
 
         pipeline = self
-        for idx, up_block in enumerate(self.unet.up_blocks):
-            inj = self.cloth_inject_blocks[idx]
+        flat = 0
+        for up_idx in range(1, L):
+            up_block = self.unet.up_blocks[up_idx]
+            for r_idx in range(resnets_per_up_block):
+                inj = self.cloth_inject_blocks[flat]
 
-            def make_hook(i, inj_ref):
-                def hook(_module, _inputs, output):
-                    feats = pipeline._cloth_feats
-                    if feats is None or feats[i] is None:
-                        return output
-                    return inj_ref(output, feats[i])
-                return hook
+                def make_hook(i, inj_ref):
+                    def hook(_module, _inputs, output):
+                        feats = pipeline._cloth_feats
+                        if feats is None or feats[i] is None:
+                            return output
+                        return inj_ref(output, feats[i])
+                    return hook
 
-            self._hook_handles.append(up_block.register_forward_hook(make_hook(idx, inj)))
+                self._hook_handles.append(
+                    up_block.resnets[r_idx].register_forward_hook(make_hook(flat, inj))
+                )
+                flat += 1
 
     # --- prompt encoding ---------------------------------------------------
 
@@ -540,7 +526,7 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         accepts_eta = "eta" in inspect.signature(self.scheduler.step).parameters
         extra_step_kwargs = {"eta": eta} if accepts_eta else {}
 
-        num_levels = len(self.unet.config.block_out_channels)
+        layers_per_block = self.unet.config.layers_per_block
 
         for i, t in enumerate(timesteps):
             # Expand latents for CFG
@@ -561,8 +547,7 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
                 return_dict=False,
             )
             cloth_feats = select_cloth_feats_for_up_blocks(
-                down_block_res_samples, mid_block_res_sample,
-                latent_model_input.shape, num_levels=num_levels,
+                down_block_res_samples, layers_per_block=layers_per_block,
             )
             cloth_feats = [f.to(dtype=dtype) if f is not None else None for f in cloth_feats]
 
