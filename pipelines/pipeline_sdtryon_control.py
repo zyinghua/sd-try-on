@@ -12,25 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-StableDiffusionSDTryOnControlPipeline
-
-Virtual try-on pipeline for the architecture trained in `train.py`:
-
-  pose image  --PoseEncoder-->  pose_latents (4 ch) ---+
-                                                       |-- concat --> UNet.conv_in (8 ch)
-  noise latent (4 ch) ---------------------------------+
-
-  cloth image -- ControlNet (empty-text conditioned) --> multi-scale features
-                                                           |
-                                                           v
-                                         one CrossAttnZeroConvBlock per UNet up_block,
-                                         injecting cloth features via cross-attention.
-
-  (optional) cloth image --CLIP vision--> image_embeds --ImageProjModel-->
-                                                           4 extra context tokens
-                                                           appended to text tokens.
-"""
 
 import inspect
 from dataclasses import dataclass

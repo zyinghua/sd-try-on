@@ -1,18 +1,3 @@
-"""Inference for the `train_control.py` architecture.
-
-Loads a checkpoint produced by `accelerator.save_state(...)` in
-`train_control.py`, which has the flat layout:
-
-    checkpoint-XXXXX/
-        model.safetensors      -> ControlNet
-        model_1.safetensors    -> UNetWithClothInjection
-                                  (keys: `unet.*` + `cloth_inject_blocks.*`)
-        model_2.safetensors    -> PoseEncoder
-        model_3.safetensors    -> IPAdapter (image_proj_model + adapter_modules)
-
-and runs inference through `StableDiffusionSDTryOnControlPipeline`.
-"""
-
 import os
 import sys
 import torch
