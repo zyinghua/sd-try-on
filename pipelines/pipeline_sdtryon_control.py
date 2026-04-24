@@ -265,6 +265,13 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         self.control_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
         )
+        # Produces single-channel [0, 1] masks used for blended-diffusion inpainting.
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor,
+            do_normalize=False,
+            do_binarize=False,
+            do_convert_grayscale=True,
+        )
 
         self._cloth_feats: Optional[List[torch.Tensor]] = None
         self._hook_handles: List[Any] = []
@@ -416,6 +423,88 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    # --- inpainting helpers ------------------------------------------------
+
+    def _encode_vae_image(self, image: torch.Tensor, generator) -> torch.Tensor:
+        """VAE-encode a pixel-space image into the 4-ch latent distribution."""
+        if isinstance(generator, list):
+            latents = torch.cat(
+                [self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(image.shape[0])],
+                dim=0,
+            )
+        else:
+            latents = self.vae.encode(image).latent_dist.sample(generator)
+        return latents * self.vae.config.scaling_factor
+
+    def _get_inpaint_timesteps(self, num_inference_steps: int, strength: float, device):
+        """Shrink the denoising schedule to the `strength` suffix (img2img-style)."""
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        return timesteps, num_inference_steps - t_start
+
+    def _prepare_inpaint_init(
+        self,
+        image,
+        mask_image,
+        height,
+        width,
+        batch_size,
+        device,
+        dtype,
+        generator,
+        strength,
+        num_inference_steps,
+    ):
+        """Preprocess source + mask and build starting latents via Blended-Diffusion init.
+
+        Returns
+        -------
+        latents : (B, 4, h, w)                   starting noisy latents for denoising
+        noise   : (B, 4, h, w)                   gaussian noise used to create `latents`
+        image_latents : (B, 4, h, w)             VAE-encoded source (clean)
+        mask : (B, 1, h, w)                      resized mask at latent resolution (1 = repaint)
+        timesteps : tensor                       effective denoising schedule
+        num_inference_steps : int                len(timesteps)
+        """
+        # --- preprocess pixel-space inputs --------------------------------
+        init_image = self.image_processor.preprocess(image, height=height, width=width)
+        init_image = init_image.to(device=device, dtype=torch.float32)
+
+        mask = self.mask_processor.preprocess(mask_image, height=height, width=width)
+        mask = F.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        ).to(device=device, dtype=dtype)
+
+        # Broadcast to full batch if needed.
+        if init_image.shape[0] == 1 and batch_size > 1:
+            init_image = init_image.expand(batch_size, -1, -1, -1)
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1, -1).contiguous()
+
+        # --- encode source into latent space ------------------------------
+        with torch.no_grad():
+            image_latents = self._encode_vae_image(init_image.to(dtype=self.vae.dtype), generator)
+        image_latents = image_latents.to(dtype=dtype)
+        if image_latents.shape[0] == 1 and batch_size > 1:
+            image_latents = image_latents.expand(batch_size, -1, -1, -1).contiguous()
+
+        # --- set up timesteps for the shortened schedule ------------------
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self._get_inpaint_timesteps(num_inference_steps, strength, device)
+        latent_timestep = timesteps[:1].repeat(batch_size)
+
+        # --- starting latents: pure noise when strength==1, else noised source ---
+        noise = randn_tensor(image_latents.shape, generator=generator, device=device, dtype=dtype)
+        if strength >= 1.0:
+            latents = noise * self.scheduler.init_noise_sigma
+        else:
+            latents = self.scheduler.add_noise(image_latents, noise, latent_timestep)
+
+        return latents, noise, image_latents, mask, timesteps, num_inference_steps
+
     # --- main entry --------------------------------------------------------
 
     @torch.no_grad()
@@ -425,6 +514,9 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         pose_image: Union[PIL.Image.Image, torch.Tensor, List[PIL.Image.Image]],
         cloth_image: Union[PIL.Image.Image, torch.Tensor, List[PIL.Image.Image]],
         cloth_clip_image: Optional[Union[PIL.Image.Image, List[PIL.Image.Image]]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, List[PIL.Image.Image]]] = None,
+        mask_image: Optional[Union[PIL.Image.Image, torch.Tensor, List[PIL.Image.Image]]] = None,
+        strength: float = 1.0,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 20,
@@ -440,6 +532,18 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
         return_dict: bool = True,
         controlnet_conditioning_scale: float = 1.0,
     ):
+        r"""
+        Additional inpainting args (mirroring ``pipeline_sdtryon.StableDiffusionIDControlPipeline``):
+
+        image (`PIL.Image.Image` | tensor | list, *optional*):
+            Source image to inpaint. Required when ``mask_image`` is provided.
+        mask_image (`PIL.Image.Image` | tensor | list, *optional*):
+            Single-channel mask; white pixels are repainted, black pixels preserved.
+            When provided, the pipeline uses Blended-Diffusion latent inpainting.
+        strength (`float`, default 1.0):
+            How much noise to add to the source. ``1.0`` == pure-noise start
+            (full repaint), smaller values keep more of the source everywhere.
+        """
         # device = self._execution_device
         # Use the UNet body's dtype as the pipeline dtype; conv_in may be fp32
         # (trainable) so reading from conv_in would not be representative.
@@ -507,23 +611,47 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
             cloth_image, height, width, batch_size, device, dtype, do_cfg
         )
 
-        # Init latents. `batch_size` already includes num_images_per_prompt
-        # because _encode_prompt repeated prompt embeds.
-        num_channels_latents = self.vae.config.latent_channels
-        latents = self._prepare_latents(
-            batch_size,
-            num_channels_latents,
-            height,
-            width,
-            dtype,
-            device,
-            generator,
-            latents,
-        )
+        # Init latents (+ optional inpainting artifacts). `batch_size` already
+        # includes num_images_per_prompt because _encode_prompt repeated embeds.
+        do_inpaint = mask_image is not None
+        if do_inpaint and image is None:
+            raise ValueError("`image` must be provided when `mask_image` is provided for inpainting.")
 
-        # Scheduler timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        num_channels_latents = self.vae.config.latent_channels
+        if do_inpaint:
+            (
+                latents,
+                inpaint_noise,
+                image_latents,
+                inpaint_mask,
+                timesteps,
+                num_inference_steps,
+            ) = self._prepare_inpaint_init(
+                image=image,
+                mask_image=mask_image,
+                height=height,
+                width=width,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+                strength=strength,
+                num_inference_steps=num_inference_steps,
+            )
+        else:
+            latents = self._prepare_latents(
+                batch_size,
+                num_channels_latents,
+                height,
+                width,
+                dtype,
+                device,
+                generator,
+                latents,
+            )
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+            inpaint_noise = image_latents = inpaint_mask = None
 
         # Extra step kwargs (eta only relevant to DDIM-style schedulers)
         accepts_eta = "eta" in inspect.signature(self.scheduler.step).parameters
@@ -570,6 +698,21 @@ class StableDiffusionSDTryOnControlPipeline(DiffusionPipeline):
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+            # Blended-Diffusion inpainting: outside the mask, re-anchor the
+            # latents to the noised source so only the masked region is
+            # actually repainted. See pipeline_stable_diffusion_inpaint.
+            if do_inpaint:
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    init_latents_proper = self.scheduler.add_noise(
+                        image_latents,
+                        inpaint_noise,
+                        torch.tensor([noise_timestep], device=device),
+                    )
+                else:
+                    init_latents_proper = image_latents
+                latents = (1 - inpaint_mask) * init_latents_proper + inpaint_mask * latents
 
         # Decode
         image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
