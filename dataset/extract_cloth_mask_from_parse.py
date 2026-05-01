@@ -1,7 +1,7 @@
 """Extract the upper-body garment region from image-parse-v3 parse maps.
 
 Usage:
-    python dataset/extract_cloth_mask.py [parse_dir]
+    python dataset/extract_cloth_mask_from_parse.py [parse_dir]
 
 Example:
     python dataset/extract_cloth_mask.py dataset/data/train/image-parse-v3
