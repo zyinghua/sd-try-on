@@ -40,12 +40,11 @@ You will need to set up training environment config first, please run `accelerat
 ```
 
 
-Please use `train.py` to train our face swap model. An exemplar usage is at `/run_scripts/train_faceswap.sh`.
-
-We also provide two additional training pipelines for ControlNet-only and ControlNet + IP-Adapter training that we used throughout our experiments, corresponding files are in the `legacy` directory.
-
+Please use `train_clip_resampler.py` to train our version of try-on model with the cloth injected via IP-Adapter only. An exemplar usage is at `run_scripts/train_sdtryon_clip_resampler.sh`.
+Please use `train_control.py` to train our version of try-on model with the cloth injected into the ControlNet simultaneously (with pose injected channel-wise). An exemplar usage is at `run_scripts/train_sdtryon_control.sh`.
 
 ## Inference
+Please head to `inference/run_sdtryon_inference.py`(IP-Adapter only version)  or `inference/run_sdtryon_control_inference.py`, and adjust the paths and hyperparameters defined at the top accordingly based on the comments. To support the generation of control conditions, we offer a script `dataset/extract_cloth_mask_from_image.py` for extracting the upper-body cloth mask from a given image, and another script `dataset/extract_densepose_from_image.py` for extracting the corresponding dense pose image.
 
 ## Compute
 Our model is trained and experimented based on two Nvidia RTX 4090 GPUs.
