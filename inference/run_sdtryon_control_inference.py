@@ -1,3 +1,11 @@
+"""Inference for the `train_control.py` architecture.
+checkpoint-XXXXX/
+    model.safetensors      -> ControlNet
+    model_1.safetensors    -> UNetWithClothInjection
+    model_2.safetensors    -> PoseEncoder
+    model_3.safetensors    -> IPAdapter (image_proj_model + adapter_modules)
+"""
+
 import os
 import sys
 import torch
@@ -40,7 +48,7 @@ else:
 
 
 # ----------------------------- Configuration -----------------------------
-IMAGE_ID = "00025"
+IMAGE_ID = "00018"
 
 BASE_MODEL = "Manojb/stable-diffusion-2-1-base"
 IMAGE_ENCODER_PATH = "patrickjohncyh/fashion-clip"
@@ -48,7 +56,7 @@ IMAGE_ENCODER_PATH = "patrickjohncyh/fashion-clip"
 CHECKPOINT_PATH = "/root/autodl-tmp/sdtryon-model/checkpoint-40000"
 
 POSE_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image-densepose/{IMAGE_ID}_00.jpg"
-CLOTH_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/cloth/00014_00.jpg"
+CLOTH_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/cloth/00022_00.jpg"
 SOURCE_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image/{IMAGE_ID}_00.jpg"
 MASK_IMAGE = f"/root/autodl-tmp/data/sdtryon/train/image_cloth_mask/{IMAGE_ID}_00.png"
 
