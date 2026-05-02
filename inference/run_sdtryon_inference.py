@@ -89,7 +89,7 @@ def main():
     print(f"Cloth image: {CLOTH_IMAGE}")
     print(f"Prompt:      {PROMPT}")
 
-    # 1. ControlNet + base pipeline
+    # ControlNet + base pipeline
     controlnet = ControlNetModel.from_pretrained(CONTROLNET_PATH, torch_dtype=DTYPE)
     pipe = StableDiffusionIDControlPipeline.from_pretrained(
         BASE_MODEL,
@@ -99,12 +99,12 @@ def main():
     )
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
-    # 2. CLIP image encoder for cloth
+    # CLIP image encoder for cloth
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(IMAGE_ENCODER_PATH).to(dtype=DTYPE)
     image_encoder.requires_grad_(False)
     clip_image_processor = CLIPImageProcessor.from_pretrained(IMAGE_ENCODER_PATH)
 
-    # 3. Load IP-Adapter
+    # Load IP-Adapter
     if MODE == "clip_resampler":
         pipe.load_ip_adapter_clip_resampler(
             IP_ADAPTER_PATH,
@@ -122,7 +122,6 @@ def main():
 
     pipe.enable_model_cpu_offload()
 
-    # 4. Inputs
     pose_image = load_image(POSE_IMAGE)
     cloth_image = load_image(CLOTH_IMAGE)
     source_image = load_image(SOURCE_IMAGE) if use_mask else None

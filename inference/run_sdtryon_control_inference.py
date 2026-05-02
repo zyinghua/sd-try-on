@@ -75,26 +75,19 @@ CONTROLNET_CONDITIONING_SCALE = 1.0
 SEED = None
 DTYPE = torch.float16
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Inpainting: if SOURCE_IMAGE and MASK_IMAGE both exist, the pipeline runs
-# blended-diffusion latent inpainting (white mask = repaint region).
-# Set STRENGTH < 1.0 to preserve more of the source image globally.
 ENABLE_INPAINT = True
 STRENGTH = 1.0
 
 ENABLE_POSE_OVERLAY = True
 POSE_OVERLAY_ALPHA = 0.4
 
-# Number of IP tokens -- must match training (ImageProjModel.clip_extra_context_tokens=4).
+# Number of IP tokens (must match training).
+# Defaults: clip_resampler=16 (Resampler num_queries), control=4 (ImageProjModel extra tokens).
 NUM_IP_TOKENS = 4
 
 
 # ----------------------- Architecture helpers ----------------------------
-# These must stay in sync with train_control.py.
-
-
 def _patch_unet_conv_in(unet: UNet2DConditionModel, new_in_channels: int) -> None:
-    """Replicates `patch_unet_conv_in` from train_control.py."""
     orig = unet.conv_in
     new = nn.Conv2d(
         new_in_channels,
@@ -113,7 +106,6 @@ def _patch_unet_conv_in(unet: UNet2DConditionModel, new_in_channels: int) -> Non
 
 
 def _build_cloth_inject_blocks(unet: UNet2DConditionModel) -> nn.ModuleList:
-    """Mirrors UNetWithClothInjection.__init__ from train_control.py."""
     boc = list(unet.config.block_out_channels)
     L = len(boc)
     up_hidden = list(reversed(boc))
@@ -133,7 +125,6 @@ def _build_cloth_inject_blocks(unet: UNet2DConditionModel) -> nn.ModuleList:
 
 
 def _install_ip_adapter_attn_processors(unet: UNet2DConditionModel) -> nn.ModuleList:
-    """Rebuild the IP-Adapter attention-processor layout from train_control.py."""
     attn_procs = {}
     unet_sd = unet.state_dict()
     for name in unet.attn_processors.keys():
@@ -219,15 +210,12 @@ def main():
 
     print(f"Loading from checkpoint: {CHECKPOINT_PATH}")
 
-    # 1. Base components (architecture-only; we overwrite weights below).
     vae = AutoencoderKL.from_pretrained(BASE_MODEL, subfolder="vae")
     text_encoder = CLIPTextModel.from_pretrained(BASE_MODEL, subfolder="text_encoder")
     tokenizer = CLIPTokenizer.from_pretrained(BASE_MODEL, subfolder="tokenizer")
     unet = UNet2DConditionModel.from_pretrained(BASE_MODEL, subfolder="unet")
-    # ControlNet architecture is `from_unet` at train time; match it here.
     controlnet = ControlNetModel.from_unet(unet, conditioning_channels=3)
 
-    # 2. Reproduce train_control.py's UNet modifications.
     pose_latent_channels = unet.config.in_channels  # 4 for SD 2.1
     _patch_unet_conv_in(unet, new_in_channels=unet.config.in_channels + pose_latent_channels)
 
@@ -247,7 +235,7 @@ def main():
     ip_adapter_modules = _install_ip_adapter_attn_processors(unet)
     ip_adapter = IPAdapter(image_proj_model=image_proj_model, adapter_modules=ip_adapter_modules)
 
-    # 3. Load checkpoint shards.
+    # Load checkpoint shards.
     controlnet.load_state_dict(load_file(shard["controlnet"]), strict=True)
     _split_and_load_wrapped_unet(shard["unet_wrap"], unet, cloth_inject_blocks)
     pose_encoder.load_state_dict(load_file(shard["pose"]), strict=True)
@@ -258,7 +246,7 @@ def main():
     ip_adapter.image_proj_model.load_state_dict(ip_proj_sd, strict=True)
     ip_adapter.adapter_modules.load_state_dict(ip_adap_sd, strict=True)
 
-    # 4. Cast + move.
+    # Cast + move.
     vae.to(DEVICE, dtype=DTYPE).eval()
     text_encoder.to(DEVICE, dtype=DTYPE).eval()
     unet.to(DEVICE, dtype=DTYPE).eval()
@@ -268,7 +256,7 @@ def main():
     image_encoder.to(DEVICE, dtype=DTYPE).eval()
     ip_adapter.to(DEVICE, dtype=DTYPE).eval()
 
-    # 5. Assemble pipeline.
+    # Assemble pipeline.
     scheduler = DDPMScheduler.from_pretrained(BASE_MODEL, subfolder="scheduler")
     pipe = StableDiffusionSDTryOnControlPipeline(
         vae=vae,
@@ -286,7 +274,6 @@ def main():
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.set_progress_bar_config(disable=False)
 
-    # 6. Inputs.
     pose_image = Image.open(POSE_IMAGE).convert("RGB")
     cloth_image = Image.open(CLOTH_IMAGE).convert("RGB")
 

@@ -60,8 +60,6 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 
 # ----------------------- Architecture helpers ----------------------------
-# Kept in sync with train_control.py / run_sdtryon_control_inference.py.
-
 
 def _patch_unet_conv_in(unet: UNet2DConditionModel, new_in_channels: int) -> None:
     orig = unet.conv_in
@@ -306,7 +304,6 @@ def main():
         pose_imgs = [Image.open(os.path.join(pose_dir, p)).convert("RGB") for p, _ in batch]
         cloth_imgs = [Image.open(os.path.join(cloth_dir, c)).convert("RGB") for _, c in batch]
 
-        # Per-batch generator so the same --seed produces the same outputs.
         generator = torch.Generator(device=device).manual_seed(args.seed + batch_start)
 
         out = pipe(

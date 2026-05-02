@@ -54,12 +54,6 @@ else:
 
 logger = logging.get_logger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Architecture blocks (mirrored from train.py; duplicated to avoid a circular
-# import between train.py <-> pipeline module).
-# ---------------------------------------------------------------------------
-
 class PoseEncoder(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 4):
         super().__init__()
